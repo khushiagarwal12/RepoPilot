@@ -33,7 +33,7 @@ def test_sqlite_requires_explicit_opt_in_and_is_anchored_to_project_root(tmp_pat
     r = _run("import backend.database as d; print(d.engine.url.drivername, d.engine.url.database)",
              tmp_path, {"REPOPILOT_ALLOW_SQLITE": "1"})
     assert r.returncode == 0, r.stderr
-    driver, db_path = r.stdout.split()
+    driver, db_path = r.stdout.strip().split(maxsplit=1)
     assert driver == "sqlite"
     assert Path(db_path) == PROJECT_ROOT / "repopilot.db"   # not relative to the cwd (tmp_path)
 
