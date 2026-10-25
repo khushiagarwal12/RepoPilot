@@ -11,7 +11,7 @@ RepoPilot lets a developer paste a public GitHub URL, indexes the repository, an
 - Git (`git --version`)
 - Node 20+ and npm (for the frontend – not required to run the backend)
 - VS Code (recommended editor)
-- No API key is needed today: embeddings run locally (`all-MiniLM-L6-v2`, downloaded on first use). An LLM key will only be needed for the planned `/ask` feature (see `docs/ASK_DESIGN.md`).
+- No API key is needed today: embeddings run locally (`all-MiniLM-L6-v2`, downloaded on first use). `/ask` needs `GEMINI_API_KEY` (see `docs/ASK_DESIGN.md`).
 
 ## Quick start (backend only)
 ```powershell
@@ -47,9 +47,10 @@ Submit a public GitHub URL -> safe download/extract -> Python AST parsing + chun
 | `POST /repositories/` | Start ingestion, returns `repository_id` and `job_id` |
 | `GET /repositories/{id}/jobs` | Job status (`pending/running/succeeded/failed`) and log |
 | `GET /repositories/{id}/definitions`, `/chunks` | Parsed symbols and persisted chunks |
+| `POST /repositories/{id}/ask` | Grounded answer from retrieved chunks with citations (`{question, top_k}`); needs `GEMINI_API_KEY`. Returns `answered` or `insufficient_evidence` |
 | `POST /repositories/{id}/search` | Semantic search (`{query, top_k}`), 409 if not indexed, 503 if index unavailable |
 
-**Not implemented yet:** LLM answers with citations (`/ask`, designed in `docs/ASK_DESIGN.md`), frontend, CI, Docker image for the API. Only Python files are indexed.
+**Not implemented yet:** frontend, CI, Docker image for the API. Only Python files are indexed.
 
 ## Tests
 ```powershell

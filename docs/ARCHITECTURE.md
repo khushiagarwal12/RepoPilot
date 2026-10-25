@@ -9,6 +9,7 @@ POST /repositories/ -> Repository + IngestionJob rows -> BackgroundTask
        commit job=succeeded
   -> delete older collections (best effort)
 POST /repositories/{id}/search -> latest SUCCEEDED job -> its collection -> hydrate chunks from PostgreSQL
+POST /repositories/{id}/ask    -> same retrieval -> evidence gate -> Gemini -> citations checked against DB rows
 ```
 
 ## Components

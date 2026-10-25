@@ -1,6 +1,7 @@
 import logging
 import os
 import shutil
+import time
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -10,13 +11,18 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend import vector_store
+from backend.ask import SNIPPET_CHARS, answer_question
 from backend.chunker.python_chunker import chunk_repository
-from backend.config import get_repo_data_dir
+from backend.config import get_ask_min_score, get_repo_data_dir
 from backend.database import SessionLocal, get_db
-from backend.embeddings import EmbeddingError
+from backend.llm import LLMClient, LLMError, get_llm_client
 from backend.models import CodeChunk, CodeDefinition, IngestionJob, Repository
 from backend.parser.python_ast import parse_repository
+from backend.retrieval import IndexUnavailableError, NotIndexedError, retrieve
 from backend.schemas import (
+    AskRequest,
+    AskResponse,
+    Citation,
     CodeChunkResponse,
     CodeDefinitionResponse,
     IngestionJobResponse,
@@ -297,82 +303,66 @@ def get_repository_chunks(
     return query.all()
 
 
-@router.post("/{repo_id}/search", response_model=List[SearchResult])
-def search_repository(repo_id: int, req: SearchRequest, response: Response, db: Session = Depends(get_db)):
-    """Semantic search over the code chunks of ONE repository.
+def _search_result(row: CodeChunk, score: float) -> SearchResult:
+    return SearchResult(
+        id=row.id, repository_id=row.repository_id, file_path=row.file_path, chunk_index=row.chunk_index,
+        chunk_type=row.chunk_type, symbol_name=row.symbol_name, start_line=row.start_line,
+        end_line=row.end_line, content=row.content, score=score,
+    )
 
-    Reads the vector index built by the repository's latest *succeeded*
-    ingestion job and returns persisted chunks (with ids, line ranges and
-    content) ordered by similarity.
 
-    Errors are explicit, never an empty list that hides a failure:
-    404 unknown repository; 409 not indexed yet; 503 embedding model or
-    vector index unavailable / out of sync.
-    """
+def _retrieve_or_http_error(db: Session, repo_id: int, query: str, top_k: int):
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
-
-    job = (
-        db.query(IngestionJob)
-        .filter(IngestionJob.repository_id == repo_id, IngestionJob.status == "succeeded")
-        .order_by(IngestionJob.id.desc())
-        .first()
-    )
-    if not job:
-        latest = (
-            db.query(IngestionJob)
-            .filter(IngestionJob.repository_id == repo_id)
-            .order_by(IngestionJob.id.desc())
-            .first()
-        )
-        state = f"latest ingestion job #{latest.id} is {latest.status}" if latest else "no ingestion job exists"
-        raise HTTPException(status_code=409, detail=f"Repository has not been indexed yet ({state}).")
-
-    chunk_total = db.query(func.count(CodeChunk.id)).filter(CodeChunk.repository_id == repo_id).scalar()
-    if not chunk_total:
-        response.headers["X-Index-Job-Id"] = str(job.id)
-        return []  # indexed successfully, but the repository has no Python chunks
-
     try:
-        hits = vector_store.search(repo_id, job.id, req.query, req.top_k)
-    except EmbeddingError as e:
-        raise HTTPException(status_code=503, detail=f"Embedding model unavailable: {sanitize_error(e)}")
-    except vector_store.VectorStoreError as e:
-        raise HTTPException(status_code=503, detail=f"Vector index unavailable: {sanitize_error(e)}")
+        return retrieve(db, repo_id, query, top_k)
+    except NotIndexedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except IndexUnavailableError as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
-    ids = [cid for cid, _ in hits]
-    rows = {
-        c.id: c
-        for c in db.query(CodeChunk).filter(CodeChunk.repository_id == repo_id, CodeChunk.id.in_(ids))
-    } if ids else {}
 
-    results: List[SearchResult] = []
-    for cid, score in hits:
-        row = rows.get(cid)
-        if row is None:
-            logger.warning("Vector hit %s has no matching chunk row in repo %s", cid, repo_id)
-            continue
-        results.append(
-            SearchResult(
-                id=row.id,
-                repository_id=row.repository_id,
-                file_path=row.file_path,
-                chunk_index=row.chunk_index,
-                chunk_type=row.chunk_type,
-                symbol_name=row.symbol_name,
-                start_line=row.start_line,
-                end_line=row.end_line,
-                content=row.content,
-                score=score,
-            )
+@router.post("/{repo_id}/search", response_model=List[SearchResult])
+def search_repository(repo_id: int, req: SearchRequest, response: Response, db: Session = Depends(get_db)):
+    """Semantic search over the code chunks of ONE repository (latest succeeded index).
+
+    Errors are explicit, never an empty list that hides a failure:
+    404 unknown repository; 409 not indexed yet; 503 embedding model or vector index unavailable / out of sync.
+    """
+    result = _retrieve_or_http_error(db, repo_id, req.query, req.top_k)
+    response.headers["X-Index-Job-Id"] = str(result.job_id)
+    return [_search_result(row, score) for row, score in result.hits]
+
+
+@router.post("/{repo_id}/ask", response_model=AskResponse)
+def ask_repository(repo_id: int, req: AskRequest, db: Session = Depends(get_db),
+                   llm: LLMClient = Depends(get_llm_client)):
+    """Answer a question using only retrieved chunks, with verifiable citations.
+
+    ``insufficient_evidence`` is returned (HTTP 200) when retrieval finds nothing relevant
+    enough, when the model says the sources do not answer the question, or when its answer
+    carries no valid citation. 404/409/503 as for /search; 503 also when the LLM fails.
+    """
+    started = time.monotonic()
+    retrieval = _retrieve_or_http_error(db, repo_id, req.question, req.top_k)
+    try:
+        result = answer_question(req.question, retrieval, llm, get_ask_min_score())
+    except LLMError as e:
+        logger.warning("ask repo=%s llm_error=%s", repo_id, type(e).__name__)
+        raise HTTPException(status_code=503, detail=f"LLM unavailable: {sanitize_error(e)}")
+
+    citations = [
+        Citation(
+            n=n, chunk_id=result.sources[n - 1][0].id, file_path=result.sources[n - 1][0].file_path,
+            start_line=result.sources[n - 1][0].start_line, end_line=result.sources[n - 1][0].end_line,
+            snippet=(result.sources[n - 1][0].content or "")[:SNIPPET_CHARS], score=result.sources[n - 1][1],
         )
-
-    if hits and not results:
-        raise HTTPException(
-            status_code=503,
-            detail="Vector index is out of sync with the database; re-run ingestion for this repository.",
-        )
-
-    response.headers["X-Index-Job-Id"] = str(job.id)
-    return results
+        for n in result.cited
+    ]
+    logger.info("ask repo=%s hits=%d status=%s cited=%d latency_ms=%d", repo_id, len(retrieval.hits),
+                result.status, len(citations), (time.monotonic() - started) * 1000)
+    return AskResponse(
+        status=result.status, answer=result.answer, citations=citations, index_job_id=retrieval.job_id,
+        model=getattr(llm, "model", None) if result.status == "answered" else None,
+    )

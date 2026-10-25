@@ -1,4 +1,6 @@
-# `/ask` design (not implemented)
+# `/ask` design and status
+
+**Status: implemented** (`backend/ask.py`, `backend/retrieval.py`, `backend/llm.py`; Gemini `gemini-2.5-flash` via REST). Verified with a fake LLM and mocked HTTP; **not yet run against the live Gemini API**. `ASK_MIN_SCORE` (default 0.20) is **uncalibrated**: tune it on real queries. v1 is stateless.
 
 ## Contract
 `POST /repositories/{id}/ask` body `{question: str (1-2000), top_k: int 1-20 = 8}` ->
@@ -26,10 +28,10 @@ Errors: 404 unknown repo, 409 not indexed, 422 bad input, 503 embedding/vector/L
 - LLM failure/timeout -> 503, never a partial or invented answer.
 
 ## Config
-`LLM_PROVIDER`, `LLM_MODEL`, provider API key variable, `LLM_TIMEOUT_SECONDS`, `ASK_MIN_SCORE`, `ASK_TOP_K`.
+`GEMINI_API_KEY`, `LLM_MODEL` (default gemini-2.5-flash), `LLM_TIMEOUT_SECONDS` (45), `ASK_MIN_SCORE` (0.20). Only a Gemini adapter exists; add another class with `complete(system, user)` for other providers.
 
 ## Tests to write
 Fake-LLM answered path with valid citations; invalid/missing citations -> insufficient; gate blocks LLM call (assert not called); injection fixture in a chunk is ignored; LLM timeout/error -> 503; repo scoping; schema/OpenAPI.
 
-## Open decisions (need your input)
-1. LLM provider and model. 2. Conversation history now or later. 3. Initial `ASK_MIN_SCORE` after a real-model calibration run.
+## Open decisions
+1. Conversation history (later). 2. Calibrate `ASK_MIN_SCORE` with the real model and live LLM.

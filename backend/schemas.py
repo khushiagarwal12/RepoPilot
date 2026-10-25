@@ -78,3 +78,36 @@ class SearchResult(CodeChunkResponse):
     """A persisted code chunk plus its similarity score (1.0 = most similar)."""
 
     score: float
+
+
+# --- Grounded question answering ---------------------------------------------
+
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    top_k: int = Field(8, ge=1, le=20, description="Number of chunks retrieved as evidence (1-20)")
+
+    @field_validator("question")
+    @classmethod
+    def question_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("question must not be blank")
+        return v
+
+
+class Citation(BaseModel):
+    n: int
+    chunk_id: int
+    file_path: str
+    start_line: int
+    end_line: int
+    snippet: str
+    score: float
+
+
+class AskResponse(BaseModel):
+    status: str  # "answered" | "insufficient_evidence"
+    answer: Optional[str] = None
+    citations: List[Citation] = []
+    index_job_id: int
+    model: Optional[str] = None

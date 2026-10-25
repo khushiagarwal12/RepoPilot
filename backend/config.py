@@ -58,3 +58,23 @@ def get_chroma_path() -> str:
 def get_repo_data_dir() -> Path:
     """Directory where extracted repositories are kept (``<root>/repo_data``)."""
     return PROJECT_ROOT / "repo_data"
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+def get_ask_min_score() -> float:
+    """Minimum similarity of the BEST retrieved chunk for /ask to call the LLM (uncalibrated default)."""
+    return _float_env("ASK_MIN_SCORE", 0.20)
+
+
+def get_llm_timeout() -> float:
+    return _float_env("LLM_TIMEOUT_SECONDS", 45.0)
+
+
+def get_llm_model() -> str:
+    return os.getenv("LLM_MODEL") or "gemini-2.5-flash"
