@@ -153,7 +153,7 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
             job.finished_at = datetime.now(timezone.utc)
             job.log = f"Ingestion failed during {stage}: {sanitize_error(e)}"
             db.commit()
-        logger.error("Ingestion job %s failed during %s: %s", job_id, stage, type(e).__name__)
+        logger.exception("Ingestion job %s failed during %s", job_id, stage)
     finally:
         db.close()
 

@@ -1,0 +1,563 @@
+From 5535daf7f637f1937fdb1312be38ccfc67a5d6f5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 17:00:23 +0000
+Subject: [PATCH] Fix migration downgrade, enforce one active job per repo,
+ recover interrupted jobs, update docs, add /ask design
+
+---
+ README.md                                     | 31 +++++++-
+ .../62460471468d_create_initial_tables.py     |  5 +-
+ ...f20b7e_unique_active_job_per_repository.py | 42 ++++++++++
+ backend/main.py                               | 19 ++++-
+ backend/models.py                             | 21 +++--
+ backend/routers/repo.py                       | 51 +++++++++++-
+ docs/ARCHITECTURE.md                          | 78 +++++++------------
+ docs/ASK_DESIGN.md                            | 35 +++++++++
+ docs/DECISIONS.md                             |  8 +-
+ docs/LEARNING_NOTES.md                        |  5 +-
+ tests/test_configuration.py                   | 11 +--
+ tests/test_job_guard.py                       | 57 ++++++++++++++
+ 12 files changed, 288 insertions(+), 75 deletions(-)
+ create mode 100644 alembic/versions/c3d9a1f20b7e_unique_active_job_per_repository.py
+ create mode 100644 docs/ASK_DESIGN.md
+ create mode 100644 tests/test_job_guard.py
+
+diff --git a/README.md b/README.md
+index 035b233..446859e 100644
+--- a/README.md
++++ b/README.md
+@@ -11,7 +11,7 @@ RepoPilot lets a developer paste a public GitHub URL, indexes the repository, an
+ - Git (`git --version`)
+ - Node 20+ and npm (for the frontend – not required to run the backend)
+ - VS Code (recommended editor)
+-- An API key for either **Google Gemini** or **OpenAI** (for embeddings & LLM calls)
++- No API key is needed today: embeddings run locally (`all-MiniLM-L6-v2`, downloaded on first use). An LLM key will only be needed for the planned `/ask` feature (see `docs/ASK_DESIGN.md`).
+ 
+ ## Quick start (backend only)
+ ```powershell
+@@ -25,6 +25,9 @@ python -m venv .venv
+ # 3️⃣ Install Python deps
+ pip install -r requirements.txt
+ 
++# 3b Create your env file (never commit .env)
++Copy-Item .env.example .env   # then edit POSTGRES_URL
++
+ # 4️⃣ Spin up PostgreSQL (Docker) – keep it running in a separate terminal
+ docker compose -f docker-compose.yml up -d
+ 
+@@ -36,9 +39,29 @@ uvicorn backend.main:app --reload
+ ```
+ Open <http://127.0.0.1:8000/health> in a browser – you should see `{ "status": "ok" }`.
+ 
+-## Next steps
+-- Phase 1: implement the `/health` endpoint and its test.
+-- Phase 2: GitHub ingestion service, etc.
++## What works today (verified by tests)
++Submit a public GitHub URL -> safe download/extract -> Python AST parsing + chunking -> PostgreSQL -> local embeddings -> ChromaDB -> per-repository semantic **search**. See `docs/ARCHITECTURE.md`.
++
++| Endpoint | Purpose |
++|---|---|
++| `POST /repositories/` | Start ingestion, returns `repository_id` and `job_id` |
++| `GET /repositories/{id}/jobs` | Job status (`pending/running/succeeded/failed`) and log |
++| `GET /repositories/{id}/definitions`, `/chunks` | Parsed symbols and persisted chunks |
++| `POST /repositories/{id}/search` | Semantic search (`{query, top_k}`), 409 if not indexed, 503 if index unavailable |
++
++**Not implemented yet:** LLM answers with citations (`/ask`, designed in `docs/ASK_DESIGN.md`), frontend, CI, Docker image for the API. Only Python files are indexed.
++
++## Tests
++```powershell
++python -m pytest -q
++```
++Tests use SQLite, real ChromaDB in a temp folder and a small stand-in embedder (no model download). PostgreSQL migrations were verified separately (`alembic upgrade head` / `downgrade base`). First real ingest downloads the embedding model, so allow a few minutes: `python scratch/ingest_test.py --timeout 600`.
++
++## Configuration (`.env`)
++`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `CHROMA_DB_PATH` (default `chroma_store`), `REPOPILOT_ENV_FILE`. Local data folders `chroma_store/`, `repo_data/` are git-ignored.
++
++## Limitations
++Single API process (interrupted jobs are marked failed at startup); no authentication or rate limiting; no CORS yet; the embedding model truncates long chunks (~256 tokens).
+ 
+ ---
+ *All secrets belong in a `.env` file that you create from `.env.example`.*
+diff --git a/alembic/versions/62460471468d_create_initial_tables.py b/alembic/versions/62460471468d_create_initial_tables.py
+index 637931a..48bd9e7 100644
+--- a/alembic/versions/62460471468d_create_initial_tables.py
++++ b/alembic/versions/62460471468d_create_initial_tables.py
+@@ -50,4 +50,7 @@ def upgrade() -> None:
+ 
+ def downgrade() -> None:
+     op.drop_table("ingestion_jobs")
+-    op.drop_table("repositories")
+\ No newline at end of file
++    op.drop_table("repositories")
++    # PostgreSQL keeps the enum type after its table is dropped; remove it so
++    # "downgrade base" followed by "upgrade head" works.
++    sa.Enum(name="job_status").drop(op.get_bind(), checkfirst=True)
+\ No newline at end of file
+diff --git a/alembic/versions/c3d9a1f20b7e_unique_active_job_per_repository.py b/alembic/versions/c3d9a1f20b7e_unique_active_job_per_repository.py
+new file mode 100644
+index 0000000..0ce9252
+--- /dev/null
++++ b/alembic/versions/c3d9a1f20b7e_unique_active_job_per_repository.py
+@@ -0,0 +1,42 @@
++"""Allow at most one pending/running ingestion job per repository.
++
++Revision ID: c3d9a1f20b7e
++Revises: 84a8321b0cd5
++"""
++from alembic import op
++import sqlalchemy as sa
++
++revision = "c3d9a1f20b7e"
++down_revision = "84a8321b0cd5"
++branch_labels = None
++depends_on = None
++
++ACTIVE = sa.text("status IN ('pending', 'running')")
++
++
++def upgrade() -> None:
++    # Existing duplicate active jobs would violate the new index: keep the newest
++    # active job of each repository and mark the older ones failed (nothing is deleted).
++    op.execute(
++        """
++        UPDATE ingestion_jobs
++        SET status = 'failed', log = 'Superseded by a newer active job (migration c3d9a1f20b7e)'
++        WHERE status IN ('pending', 'running')
++          AND id NOT IN (
++              SELECT MAX(id) FROM ingestion_jobs
++              WHERE status IN ('pending', 'running') GROUP BY repository_id
++          )
++        """
++    )
++    op.create_index(
++        "uq_ingestion_jobs_one_active_per_repo",
++        "ingestion_jobs",
++        ["repository_id"],
++        unique=True,
++        postgresql_where=ACTIVE,
++        sqlite_where=ACTIVE,
++    )
++
++
++def downgrade() -> None:
++    op.drop_index("uq_ingestion_jobs_one_active_per_repo", table_name="ingestion_jobs")
+diff --git a/backend/main.py b/backend/main.py
+index 559a846..63d649a 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -1,3 +1,6 @@
++import logging
++from contextlib import asynccontextmanager
++
+ from fastapi import FastAPI
+ from fastapi.responses import JSONResponse
+ 
+@@ -7,7 +10,21 @@ load_env()  # explicit, cwd-independent .env path; must run before the modules b
+ 
+ from backend.routers import repo  # noqa: E402
+ 
+-app = FastAPI(title="RepoPilot Backend")
++logger = logging.getLogger(__name__)
++
++
++@asynccontextmanager
++async def lifespan(_app: FastAPI):
++    try:
++        recovered = repo.recover_interrupted_jobs()
++        if recovered:
++            logger.warning("Marked %d interrupted ingestion job(s) as failed", recovered)
++    except Exception as exc:  # noqa: BLE001 - startup must not crash, but the cause is logged
++        logger.error("Could not recover interrupted jobs: %s", type(exc).__name__)
++    yield
++
++
++app = FastAPI(title="RepoPilot Backend", lifespan=lifespan)
+ 
+ # Register routers
+ app.include_router(repo.router)
+diff --git a/backend/models.py b/backend/models.py
+index 21ec062..ec65060 100644
+--- a/backend/models.py
++++ b/backend/models.py
+@@ -1,6 +1,6 @@
+ from datetime import datetime, timezone
+ import enum
+-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum
++from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum, Index, text
+ from sqlalchemy.orm import relationship
+ from backend.database import Base
+ 
+@@ -15,7 +15,7 @@ class JobStatus(str, enum.Enum):
+ class Repository(Base):
+     __tablename__ = "repositories"
+ 
+-    id = Column(Integer, primary_key=True, index=True)
++    id = Column(Integer, primary_key=True)
+     github_url = Column(Text, nullable=False, unique=True)
+     name = Column(Text, nullable=False)
+     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+@@ -30,7 +30,7 @@ class Repository(Base):
+ class IngestionJob(Base):
+     __tablename__ = "ingestion_jobs"
+ 
+-    id = Column(Integer, primary_key=True, index=True)
++    id = Column(Integer, primary_key=True)
+     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
+     status = Column(Enum("pending", "running", "succeeded", "failed", name="job_status"), nullable=False, default="pending")
+     started_at = Column(DateTime(timezone=True), nullable=True)
+@@ -39,11 +39,22 @@ class IngestionJob(Base):
+ 
+     repository = relationship("Repository", back_populates="jobs")
+ 
++    __table_args__ = (
++        # Database-enforced guard: at most one pending/running job per repository.
++        Index(
++            "uq_ingestion_jobs_one_active_per_repo",
++            "repository_id",
++            unique=True,
++            postgresql_where=text("status IN ('pending', 'running')"),
++            sqlite_where=text("status IN ('pending', 'running')"),
++        ),
++    )
++
+ 
+ class CodeDefinition(Base):
+     __tablename__ = "code_definitions"
+ 
+-    id = Column(Integer, primary_key=True, index=True)
++    id = Column(Integer, primary_key=True)
+     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
+     file_path = Column(Text, nullable=False)
+     name = Column(Text, nullable=False, index=True)
+@@ -58,7 +69,7 @@ class CodeDefinition(Base):
+ class CodeChunk(Base):
+     __tablename__ = "code_chunks"
+ 
+-    id = Column(Integer, primary_key=True, index=True)
++    id = Column(Integer, primary_key=True)
+     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
+     file_path = Column(Text, nullable=False)
+     chunk_index = Column(Integer, nullable=False)
+diff --git a/backend/routers/repo.py b/backend/routers/repo.py
+index 786d4bf..bf1d6a8 100644
+--- a/backend/routers/repo.py
++++ b/backend/routers/repo.py
+@@ -6,6 +6,7 @@ from typing import List, Optional
+ 
+ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
+ from sqlalchemy import func
++from sqlalchemy.exc import IntegrityError
+ from sqlalchemy.orm import Session
+ 
+ from backend import vector_store
+@@ -157,6 +158,26 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
+         db.close()
+ 
+ 
++def recover_interrupted_jobs(db_factory=SessionLocal) -> int:
++    """Mark pending/running jobs as failed. Call once at startup.
++
++    Ingestion runs in this process's background tasks, so after a restart no such
++    job can still be running; leaving them active would block re-indexing forever.
++    (Assumes a single API process; revisit if you run several workers.)
++    """
++    db = db_factory()
++    try:
++        jobs = db.query(IngestionJob).filter(IngestionJob.status.in_(["pending", "running"])).all()
++        for job in jobs:
++            job.status = "failed"
++            job.finished_at = datetime.now(timezone.utc)
++            job.log = "Interrupted: the server restarted before this job finished. Submit the repository again."
++        db.commit()
++        return len(jobs)
++    finally:
++        db.close()
++
++
+ @router.post("/", response_model=IngestResponse)
+ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+     url_str = str(payload.github_url).rstrip("/")
+@@ -172,8 +193,15 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
+             name=f"{owner}/{repo_name}",
+         )
+         db.add(repo)
+-        db.commit()
+-        db.refresh(repo)
++        try:
++            db.commit()
++        except IntegrityError:  # another request created the same repository first
++            db.rollback()
++            repo = db.query(Repository).filter(Repository.github_url == url_str).first()
++            if repo is None:
++                raise
++        else:
++            db.refresh(repo)
+ 
+     # Guard against concurrent duplicate execution
+     active_job = (
+@@ -190,7 +218,24 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
+ 
+     job = IngestionJob(repository_id=repo.id, status="pending")
+     db.add(job)
+-    db.commit()
++    try:
++        db.commit()
++    except IntegrityError:
++        # The database allows only one pending/running job per repository, so a
++        # concurrent request won the race: report that job instead of failing.
++        db.rollback()
++        active_job = (
++            db.query(IngestionJob)
++            .filter(IngestionJob.repository_id == repo.id, IngestionJob.status.in_(["pending", "running"]))
++            .first()
++        )
++        if active_job is None:
++            raise
++        return IngestResponse(
++            repository_id=repo.id,
++            job_id=active_job.id,
++            message=f"An ingestion job (#{active_job.id}) is already {active_job.status} for this repository.",
++        )
+     db.refresh(job)
+ 
+     background_tasks.add_task(process_repository_ingestion, repo.id, job.id, url_str)
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 2febf93..793b9fd 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -1,55 +1,29 @@
+-# RepoPilot Architecture & System Design
++# RepoPilot Architecture (as implemented)
+ 
+-RepoPilot is an AI-powered codebase intelligence assistant designed to ingest GitHub repositories, extract AST code definitions, generate semantic code chunks, index embeddings in a vector database, and answer questions via retrieval-augmented generation (RAG).
+-
+-```mermaid
+-flowchart TD
+-    Client["Client / API Consumer"] -->|POST /repositories/| Router["FastAPI Ingestion Router"]
+-    Client -->|GET /repositories/{id}/chunks| Router
+-    Client -->|GET /health| Health["Health Endpoint"]
+-
+-    subgraph Ingestion Pipeline [Asynchronous Ingestion Worker]
+-        Router -->|Background Task| Worker["process_repository_ingestion"]
+-        Worker -->|1. Download Zipball & Safe Extract| GH["GitHub Archive Service (Zip Slip Protected)"]
+-        GH -->|Extracted Code| FS["Local Filesystem (repo_data/{repo_id})"]
+-        FS -->|2. AST Visitor| Parser["Python AST Parser (functions & classes)"]
+-        FS -->|3. AST Semantic Slicing| Chunker["Python Semantic Chunker"]
+-        
+-        Parser -->|CodeDefinition Records| DB[("PostgreSQL / SQLite")]
+-        Chunker -->|CodeChunk Records| DB
+-        Worker -->|Job Status: Succeeded/Failed| DB
+-    end
+-
+-    subgraph Future Phase 5
+-        Chunker -.->|Chunks| VectorStore[("ChromaDB Vector Store")]
+-    end
++```
++POST /repositories/ -> Repository + IngestionJob rows -> BackgroundTask
++  download zipball (allow-listed hosts, size/time caps) -> safe_extract_zip (staging dir, symlinks skipped)
++  -> ast parse + chunk (repo-relative paths) -> ONE DB transaction:
++       replace definitions/chunks, flush (real chunk ids)
++       build Chroma collection repo_<repo>_job_<job> (embeddings)   <- before commit
++       commit job=succeeded
++  -> delete older collections (best effort)
++POST /repositories/{id}/search -> latest SUCCEEDED job -> its collection -> hydrate chunks from PostgreSQL
+ ```
+ 
+-## System Components
+-
+-1. **API Layer (`backend/main.py`, `backend/routers/`)**:
+-   - `GET /health`: Liveness probe.
+-   - `POST /repositories/`: Validates GitHub URL, stores repository & job records, triggers asynchronous ingestion worker.
+-   - `GET /repositories/{repo_id}`: Fetches repository metadata.
+-   - `GET /repositories/{repo_id}/jobs`: Fetches job status and logs.
+-   - `GET /repositories/{repo_id}/definitions`: Lists parsed functions and classes (supports `?definition_type=` filter).
+-   - `GET /repositories/{repo_id}/chunks`: Lists semantically chunked code snippets (supports `?chunk_type=` filter).
+-
+-2. **Ingestion & Security Layer (`backend/utils/github.py`)**:
+-   - Validates GitHub URLs (rejects non-GitHub domains).
+-   - Downloads GitHub zipball stream with timeouts.
+-   - **Security**: Validates against Zip Slip (path traversal) and decompression bombs (file count & uncompressed byte caps).
+-
+-3. **AST Parser Layer (`backend/parser/python_ast.py`)**:
+-   - Traverses Python AST using `ast.NodeVisitor`.
+-   - Extracts top-level classes and functions with exact 1-based start and end line ranges.
+-   - Skips syntax errors and empty files cleanly.
+-
+-4. **Chunking Layer (`backend/chunker/python_chunker.py`)**:
+-   - Generates AST-aware semantic chunks.
+-   - Slices oversized functions using sliding windows with line overlap.
+-   - Captures module-level constants and imports.
+-
+-5. **Storage Layer (`backend/models.py`, `backend/database.py`, `alembic/`)**:
+-   - Relational store managed via SQLAlchemy ORM and Alembic migrations.
+-   - Tables: `repositories`, `ingestion_jobs`, `code_definitions`, `code_chunks`.
++## Components
++- `backend/routers/repo.py` API + ingestion worker; `backend/utils/github.py` URL validation, download, safe extraction.
++- `backend/parser`, `backend/chunker`: Python `ast` only. Repository code is never imported or executed.
++- `backend/models.py` + `alembic/`: repositories, ingestion_jobs, code_definitions, code_chunks.
++- `backend/embeddings.py` (lazy sentence-transformers), `backend/vector_store.py` (lazy persistent Chroma).
++- `backend/config.py`: project-root anchored paths and explicit `.env` loading.
++
++## PostgreSQL vs ChromaDB consistency (no shared transaction)
++- Each job has its own collection; the committed `succeeded` job is the pointer to the live index.
++- Embedding/index failure -> DB rollback, half-built collection dropped, previous data and index untouched, job `failed` with a sanitized error.
++- Crash between index build and commit leaves an orphan collection: never queried, removed after the next successful ingest of that repository.
++- Cleanup of old collections after commit may fail without affecting correctness (search ignores them).
++- A database partial unique index allows only one pending/running job per repository; jobs left active by a restart are marked failed at startup.
++
++## Known limits
++Python files only; single process; no auth/rate limiting; no LLM answering yet (`docs/ASK_DESIGN.md`).
+diff --git a/docs/ASK_DESIGN.md b/docs/ASK_DESIGN.md
+new file mode 100644
+index 0000000..2bd073f
+--- /dev/null
++++ b/docs/ASK_DESIGN.md
+@@ -0,0 +1,35 @@
++# `/ask` design (not implemented)
++
++## Contract
++`POST /repositories/{id}/ask` body `{question: str (1-2000), top_k: int 1-20 = 8}` ->
++```
++{ status: "answered" | "insufficient_evidence",
++  answer: str | null,
++  citations: [{n, chunk_id, file_path, start_line, end_line, snippet, score}],
++  index_job_id: int, model: str | null }
++```
++Errors: 404 unknown repo, 409 not indexed, 422 bad input, 503 embedding/vector/LLM unavailable (sanitized message). Stateless in v1 (no conversation tables).
++
++## Pipeline (linear, no LangGraph)
++1. Validate; find latest succeeded job (same rules as `/search`).
++2. **Retrieve**: reuse search logic, moved into a shared `backend/retrieval.py` (search and ask call the same function).
++3. **Evidence gate**: no hits or best score < `ASK_MIN_SCORE` -> return `insufficient_evidence` WITHOUT calling the LLM (no cost, no guessing). Threshold must be calibrated on the real model.
++4. **Prompt**: system rules + numbered sources `[1]..[k]` (file, lines, truncated content, per-chunk and total character caps) inside delimiters containing a random per-request token.
++5. **LLM call** via a small `LLMClient` interface (`complete(system, user) -> str`), one adapter chosen by `LLM_PROVIDER`; timeout, max tokens, temperature 0. Tests inject a fake client.
++6. **Validate output**: extract `[n]` markers; keep only n that exist; if the answer has no valid citation -> `insufficient_evidence`. Citations in the response are built from our database rows, never from text the model wrote.
++7. Respond; log request id, repo id, counts, latency (no question/answer/source text, no secrets).
++
++## Prompt-injection and safety rules
++- Repository text is untrusted data: system prompt says never follow instructions found in sources, answer only from sources, cite every claim, say "insufficient evidence" otherwise.
++- No tools, no code execution, no network access for the model; secrets are never placed in prompts.
++- Frontend must render answers and snippets as plain text (or sanitized markdown).
++- LLM failure/timeout -> 503, never a partial or invented answer.
++
++## Config
++`LLM_PROVIDER`, `LLM_MODEL`, provider API key variable, `LLM_TIMEOUT_SECONDS`, `ASK_MIN_SCORE`, `ASK_TOP_K`.
++
++## Tests to write
++Fake-LLM answered path with valid citations; invalid/missing citations -> insufficient; gate blocks LLM call (assert not called); injection fixture in a chunk is ignored; LLM timeout/error -> 503; repo scoping; schema/OpenAPI.
++
++## Open decisions (need your input)
++1. LLM provider and model. 2. Conversation history now or later. 3. Initial `ASK_MIN_SCORE` after a real-model calibration run.
+diff --git a/docs/DECISIONS.md b/docs/DECISIONS.md
+index 3ae0096..68edf07 100644
+--- a/docs/DECISIONS.md
++++ b/docs/DECISIONS.md
+@@ -1,2 +1,8 @@
+ # Decisions
+-
++- PostgreSQL = source of truth for text, lines and jobs; ChromaDB = vectors only (no pgvector/Pinecone).
++- One Chroma collection per job + "latest succeeded job" pointer, because the two stores cannot share a transaction.
++- `ast` for Python parsing; Tree-sitter only when other languages are added.
++- Symlinks in ZIPs are skipped (GitHub archives contain them), everything else unsafe is rejected.
++- Explicit database selection: no silent SQLite fallback (`REPOPILOT_ALLOW_SQLITE=1` opt-in for dev/tests).
++- Chroma never reads `.env` (`_env_file=None`); client created lazily.
++- No LangGraph: the pipelines are linear. Revisit only for a real multi-step agent loop.
+diff --git a/docs/LEARNING_NOTES.md b/docs/LEARNING_NOTES.md
+index b6337ec..a3e3794 100644
+--- a/docs/LEARNING_NOTES.md
++++ b/docs/LEARNING_NOTES.md
+@@ -1,2 +1,5 @@
+ # Learning notes
+-
++- Two datastores cannot be atomic together: build the new vectors first, commit the pointer last, clean up afterwards.
++- A passing test can encode a bug (the old symlink test); use mutation checks to prove tests can fail.
++- Libraries can read files you did not expect (Chroma reads `./.env`); pin behaviour explicitly.
++- Enforce invariants in the database (partial unique index), not only in application code.
+diff --git a/tests/test_configuration.py b/tests/test_configuration.py
+index f2dedfd..491575c 100644
+--- a/tests/test_configuration.py
++++ b/tests/test_configuration.py
+@@ -45,13 +45,10 @@ def test_postgres_url_is_used_when_set(tmp_path):
+     assert r.stdout.split() == ["postgresql", "db.example", "mydb"]
+ 
+ 
+-def test_failure_message_never_contains_database_credentials(tmp_path):
+-    r = _run("import backend.database", tmp_path, {"POSTGRES_URL": "notaurl-with-secret-hunter2"})
+-    assert r.returncode != 0
+-    assert "hunter2" not in r.stdout + r.stderr or "hunter2" in r.stderr  # SQLAlchemy may echo; see next test
+-    # The application's own message path (missing URL) must be credential free:
+-    r2 = _run("import backend.database", tmp_path)
+-    assert "hunter2" not in r2.stderr
++def test_missing_database_message_never_contains_credentials(tmp_path):
++    r = _run("import backend.database", tmp_path, {"REPOPILOT_ENV_FILE": str(tmp_path / "x.env")})
++    assert r.returncode != 0 and "POSTGRES_URL is not set" in r.stderr
++    assert "hunter2" not in r.stdout + r.stderr
+ 
+ 
+ # ------------------------------------------------------------------ .env loading
+diff --git a/tests/test_job_guard.py b/tests/test_job_guard.py
+new file mode 100644
+index 0000000..e34593d
+--- /dev/null
++++ b/tests/test_job_guard.py
+@@ -0,0 +1,57 @@
++"""One active job per repository (DB-enforced) and recovery of interrupted jobs."""
++import pytest
++from sqlalchemy import create_engine
++from sqlalchemy.exc import IntegrityError
++from sqlalchemy.orm import sessionmaker
++
++from backend.database import Base
++from backend.models import IngestionJob, Repository
++from backend.routers.repo import recover_interrupted_jobs
++
++
++@pytest.fixture
++def Session(tmp_path):
++    engine = create_engine(f"sqlite:///{tmp_path / 'g.db'}")
++    Base.metadata.create_all(engine)
++    yield sessionmaker(bind=engine)
++    engine.dispose()
++
++
++def _repo(db):
++    r = Repository(github_url="https://github.com/a/b", name="a/b")
++    db.add(r)
++    db.commit()
++    return r.id
++
++
++def test_database_rejects_second_active_job(Session):
++    db = Session()
++    rid = _repo(db)
++    db.add(IngestionJob(repository_id=rid, status="running"))
++    db.commit()
++    db.add(IngestionJob(repository_id=rid, status="pending"))
++    with pytest.raises(IntegrityError):
++        db.commit()
++
++
++def test_finished_jobs_do_not_block_new_active_job(Session):
++    db = Session()
++    rid = _repo(db)
++    db.add_all([IngestionJob(repository_id=rid, status="succeeded"),
++                IngestionJob(repository_id=rid, status="failed"),
++                IngestionJob(repository_id=rid, status="pending")])
++    db.commit()  # must not raise
++
++
++def test_recover_interrupted_jobs_marks_active_jobs_failed(Session):
++    db = Session()
++    rid = _repo(db)
++    db.add_all([IngestionJob(repository_id=rid, status="succeeded"), IngestionJob(repository_id=rid, status="running")])
++    db.commit()
++    assert recover_interrupted_jobs(Session) == 1
++    statuses = sorted(j.status for j in db.query(IngestionJob).all())
++    assert statuses == ["failed", "succeeded"]
++    assert "restarted" in db.query(IngestionJob).filter_by(status="failed").one().log
++    db.add(IngestionJob(repository_id=rid, status="pending"))
++    db.commit()  # re-indexing is possible again
++    assert recover_interrupted_jobs(Session) == 1
+-- 
+2.43.0
+
