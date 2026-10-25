@@ -1,65 +1,61 @@
+import logging
 import os
 import shutil
 from datetime import datetime, timezone
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from backend.database import get_db, SessionLocal
-from backend.models import Repository, IngestionJob, CodeDefinition, CodeChunk
-from backend.schemas import (
-    RepositoryCreate,
-    IngestResponse,
-    CodeDefinitionResponse,
-    CodeChunkResponse,
-    RepositoryResponse,
-    IngestionJobResponse,
-    SearchRequest,
-    SearchResult,
-)
-from backend.utils.github import parse_github_url, download_and_extract_repo
-from backend.parser.python_ast import parse_repository
-from backend.chunker.python_chunker import chunk_repository
-# New imports for semantic search integration
 from backend import vector_store
-
-import shutil
-from datetime import datetime, timezone
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from sqlalchemy.orm import Session
-
-from backend.database import get_db, SessionLocal
-from backend.models import Repository, IngestionJob, CodeDefinition, CodeChunk
+from backend.chunker.python_chunker import chunk_repository
+from backend.config import get_repo_data_dir
+from backend.database import SessionLocal, get_db
+from backend.embeddings import EmbeddingError
+from backend.models import CodeChunk, CodeDefinition, IngestionJob, Repository
+from backend.parser.python_ast import parse_repository
 from backend.schemas import (
-    RepositoryCreate,
-    IngestResponse,
-    CodeDefinitionResponse,
     CodeChunkResponse,
-    RepositoryResponse,
+    CodeDefinitionResponse,
     IngestionJobResponse,
+    IngestResponse,
+    RepositoryCreate,
+    RepositoryResponse,
     SearchRequest,
     SearchResult,
 )
-from backend.utils.github import parse_github_url, download_and_extract_repo
-from backend.parser.python_ast import parse_repository
-from backend.chunker.python_chunker import chunk_repository
+from backend.utils.errors import sanitize_error
+from backend.utils.github import download_and_extract_repo, parse_github_url
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/repositories", tags=["repositories"])
 
 
 def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_factory=SessionLocal):
-    """Worker task to download repository, extract code, parse AST definitions, and generate code chunks.
+    """Worker task: download, parse, chunk, persist and vector-index a repository.
 
-    Guarantees:
-    - Atomicity: Old definitions/chunks are deleted and new ones inserted within a single transaction.
-    - Rollback on failure: If parsing/insertion fails, database rolls back to keep previous index intact.
-    - Safe filesystem cleanup on failure: If extraction fails, target folder is wiped.
+    Success criteria: a job is marked ``succeeded`` only when the database rows
+    AND the vector index for this job are both in place.
+
+    Ordering / recovery guarantees:
+    1. Old definitions/chunks are replaced inside ONE database transaction.
+    2. The job's vector collection is built BEFORE that transaction commits.
+       Any extraction, parsing, embedding or indexing error rolls the
+       transaction back, removes the half-built collection, and marks the job
+       ``failed`` with a sanitized error. The previous data and index (from the
+       last succeeded job) remain intact and queryable.
+    3. Only after the commit are older collections deleted. If that cleanup
+       fails the job is still ``succeeded``: search only reads the collection of
+       the latest succeeded job, so leftovers are never returned.
     """
     db: Session = db_factory()
-    base_repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "repo_data", str(repo_id)))
+    base_repo_dir = str(get_repo_data_dir() / str(repo_id))
     temp_extract_dir = f"{base_repo_dir}_incoming"
 
+    stage = "starting"
+    collection_built = False
     try:
         job = db.query(IngestionJob).filter(IngestionJob.id == job_id).first()
         if not job:
@@ -69,13 +65,13 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
         job.started_at = datetime.now(timezone.utc)
         db.commit()
 
-        # Clean any stale incoming directory
         if os.path.exists(temp_extract_dir):
             shutil.rmtree(temp_extract_dir, ignore_errors=True)
 
+        stage = "download and extraction"
         extracted_dir = download_and_extract_repo(str(github_url), temp_extract_dir)
 
-        # 1. Parse AST definitions in memory
+        stage = "parsing"
         parsed_definitions = parse_repository(extracted_dir)
         new_definitions = [
             CodeDefinition(
@@ -88,8 +84,6 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
             )
             for def_item in parsed_definitions
         ]
-
-        # 2. Generate semantic code chunks in memory
         parsed_chunks = chunk_repository(extracted_dir)
         new_chunks = [
             CodeChunk(
@@ -105,49 +99,50 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
             for c in parsed_chunks
         ]
 
-        # 3. Atomic Database Replacement in a single transaction
-        try:
-            # Delete old rows
-            db.query(CodeDefinition).filter(CodeDefinition.repository_id == repo_id).delete()
-            db.query(CodeChunk).filter(CodeChunk.repository_id == repo_id).delete()
+        stage = "database update"
+        db.query(CodeDefinition).filter(CodeDefinition.repository_id == repo_id).delete()
+        db.query(CodeChunk).filter(CodeChunk.repository_id == repo_id).delete()
+        # add_all + flush (not bulk_save_objects) so every chunk gets its primary key,
+        # which is the vector ID.
+        db.add_all(new_definitions)
+        db.add_all(new_chunks)
+        db.flush()
 
-            # Insert new rows
-            if new_definitions:
-                db.bulk_save_objects(new_definitions)
-            if new_chunks:
-                db.bulk_save_objects(new_chunks)
+        stage = "vector indexing"
+        indexed = vector_store.index_chunks(repo_id, job_id, new_chunks)
+        collection_built = indexed > 0
 
-            # Flush to assign IDs (optional, commit will assign too)
-            db.flush()
+        stage = "finalizing"
+        if os.path.exists(temp_extract_dir):
+            if os.path.exists(base_repo_dir):
+                shutil.rmtree(base_repo_dir, ignore_errors=True)
+            os.makedirs(os.path.dirname(base_repo_dir), exist_ok=True)
+            shutil.move(temp_extract_dir, base_repo_dir)
 
-            # Move extracted directory to live directory if temp_extract_dir was created
-            if os.path.exists(temp_extract_dir):
-                if os.path.exists(base_repo_dir):
-                    shutil.rmtree(base_repo_dir, ignore_errors=True)
-                os.makedirs(os.path.dirname(base_repo_dir), exist_ok=True)
-                shutil.move(temp_extract_dir, base_repo_dir)
+        job.status = "succeeded"
+        job.finished_at = datetime.now(timezone.utc)
+        if new_chunks:
+            index_note = f"indexed {indexed} vectors"
+        else:
+            index_note = "no indexable Python chunks found, nothing to index"
+        job.log = (
+            f"Successfully ingested. Parsed {len(new_definitions)} symbols, "
+            f"generated {len(new_chunks)} chunks, {index_note}."
+        )
+        db.commit()
+        collection_built = False  # committed: this job's collection is now the live index
 
-            job.status = "succeeded"
-            job.finished_at = datetime.now(timezone.utc)
-            job.log = (
-                f"Successfully ingested and extracted. "
-                f"Parsed {len(new_definitions)} symbols, generated {len(new_chunks)} chunks."
-            )
-            db.commit()
-
-            # ---------- Vector store upsert (non‑critical) ----------
-            try:
-                vector_store.add_chunks(new_chunks)
-            except Exception as ve:
-                # Log error but do not affect ingestion outcome
-                print(f"Vector store error (non‑critical): {ve}")
-        
-        except Exception:
-            db.rollback()
-            raise
+        # Post-commit cleanup of superseded indexes (best effort, never changes job status).
+        leftovers = vector_store.delete_repo_collections(
+            repo_id, keep_job_id=job_id if new_chunks else None
+        )
+        if leftovers:
+            logger.warning("Repo %s: %d stale vector collection(s) not deleted", repo_id, len(leftovers))
 
     except Exception as e:
-        # Clean incoming temp dir on failure
+        db.rollback()
+        if collection_built:
+            vector_store.drop_collection(repo_id, job_id)
         if os.path.exists(temp_extract_dir):
             shutil.rmtree(temp_extract_dir, ignore_errors=True)
 
@@ -155,8 +150,9 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
         if job:
             job.status = "failed"
             job.finished_at = datetime.now(timezone.utc)
-            job.log = f"Ingestion error: {str(e)}"
+            job.log = f"Ingestion failed during {stage}: {sanitize_error(e)}"
             db.commit()
+        logger.error("Ingestion job %s failed during %s: %s", job_id, stage, type(e).__name__)
     finally:
         db.close()
 
@@ -179,7 +175,7 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
         db.commit()
         db.refresh(repo)
 
-    # Check for actively running job to guard concurrent duplicate execution
+    # Guard against concurrent duplicate execution
     active_job = (
         db.query(IngestionJob)
         .filter(IngestionJob.repository_id == repo.id, IngestionJob.status.in_(["pending", "running"]))
@@ -192,10 +188,7 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
             message=f"An ingestion job (#{active_job.id}) is already {active_job.status} for this repository.",
         )
 
-    job = IngestionJob(
-        repository_id=repo.id,
-        status="pending",
-    )
+    job = IngestionJob(repository_id=repo.id, status="pending")
     db.add(job)
     db.commit()
     db.refresh(job)
@@ -205,7 +198,7 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
     return IngestResponse(
         repository_id=repo.id,
         job_id=job.id,
-        message="Repository ingestion scheduled successfully."
+        message="Repository ingestion scheduled successfully.",
     )
 
 
@@ -241,19 +234,6 @@ def get_repository_definitions(
 
     return query.all()
 
-@router.post("/{repo_id}/search", response_model=List[SearchResult])
-def search_repository(repo_id: int, req: SearchRequest, db: Session = Depends(get_db)):
-    """Semantic search over code chunks of a repository.
-    The vector store is queried with the provided query and top_k limit.
-    """
-    # Verify repository exists
-    repo = db.query(Repository).filter(Repository.id == repo_id).first()
-    if not repo:
-        raise HTTPException(status_code=404, detail="Repository not found")
-    # Perform search via vector store
-    results = vector_store.search(repo_id, req.query, k=req.top_k)
-    return results
-
 
 @router.get("/{repo_id}/chunks", response_model=List[CodeChunkResponse])
 def get_repository_chunks(
@@ -271,15 +251,83 @@ def get_repository_chunks(
 
     return query.all()
 
+
 @router.post("/{repo_id}/search", response_model=List[SearchResult])
-def search_repository(repo_id: int, req: SearchRequest, db: Session = Depends(get_db)):
-    """Semantic search over code chunks of a repository.
-    The vector store is queried with the provided query and top_k limit.
+def search_repository(repo_id: int, req: SearchRequest, response: Response, db: Session = Depends(get_db)):
+    """Semantic search over the code chunks of ONE repository.
+
+    Reads the vector index built by the repository's latest *succeeded*
+    ingestion job and returns persisted chunks (with ids, line ranges and
+    content) ordered by similarity.
+
+    Errors are explicit, never an empty list that hides a failure:
+    404 unknown repository; 409 not indexed yet; 503 embedding model or
+    vector index unavailable / out of sync.
     """
-    # Verify repository exists
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
-    # Perform search via vector store
-    results = vector_store.search(repo_id, req.query, k=req.top_k)
+
+    job = (
+        db.query(IngestionJob)
+        .filter(IngestionJob.repository_id == repo_id, IngestionJob.status == "succeeded")
+        .order_by(IngestionJob.id.desc())
+        .first()
+    )
+    if not job:
+        latest = (
+            db.query(IngestionJob)
+            .filter(IngestionJob.repository_id == repo_id)
+            .order_by(IngestionJob.id.desc())
+            .first()
+        )
+        state = f"latest ingestion job #{latest.id} is {latest.status}" if latest else "no ingestion job exists"
+        raise HTTPException(status_code=409, detail=f"Repository has not been indexed yet ({state}).")
+
+    chunk_total = db.query(func.count(CodeChunk.id)).filter(CodeChunk.repository_id == repo_id).scalar()
+    if not chunk_total:
+        response.headers["X-Index-Job-Id"] = str(job.id)
+        return []  # indexed successfully, but the repository has no Python chunks
+
+    try:
+        hits = vector_store.search(repo_id, job.id, req.query, req.top_k)
+    except EmbeddingError as e:
+        raise HTTPException(status_code=503, detail=f"Embedding model unavailable: {sanitize_error(e)}")
+    except vector_store.VectorStoreError as e:
+        raise HTTPException(status_code=503, detail=f"Vector index unavailable: {sanitize_error(e)}")
+
+    ids = [cid for cid, _ in hits]
+    rows = {
+        c.id: c
+        for c in db.query(CodeChunk).filter(CodeChunk.repository_id == repo_id, CodeChunk.id.in_(ids))
+    } if ids else {}
+
+    results: List[SearchResult] = []
+    for cid, score in hits:
+        row = rows.get(cid)
+        if row is None:
+            logger.warning("Vector hit %s has no matching chunk row in repo %s", cid, repo_id)
+            continue
+        results.append(
+            SearchResult(
+                id=row.id,
+                repository_id=row.repository_id,
+                file_path=row.file_path,
+                chunk_index=row.chunk_index,
+                chunk_type=row.chunk_type,
+                symbol_name=row.symbol_name,
+                start_line=row.start_line,
+                end_line=row.end_line,
+                content=row.content,
+                score=score,
+            )
+        )
+
+    if hits and not results:
+        raise HTTPException(
+            status_code=503,
+            detail="Vector index is out of sync with the database; re-run ingestion for this repository.",
+        )
+
+    response.headers["X-Index-Job-Id"] = str(job.id)
     return results

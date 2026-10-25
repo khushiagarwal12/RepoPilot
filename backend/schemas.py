@@ -1,4 +1,4 @@
-from pydantic import BaseModel, HttpUrl, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 from typing import Optional, List
 from datetime import datetime
 
@@ -59,24 +59,22 @@ class CodeChunkResponse(BaseModel):
     end_line: int
     content: str
 
-# New models for semantic search
+# --- Semantic search ---------------------------------------------------------
+
 class SearchRequest(BaseModel):
-    query: str
-    top_k: int = 5
+    query: str = Field(..., min_length=1, max_length=2000, description="Natural-language or code query")
+    top_k: int = Field(5, ge=1, le=50, description="Number of results to return (1-50)")
 
-class SearchResult(BaseModel):
-    file_path: str
-    name: str
-    type: str
+    @field_validator("query")
+    @classmethod
+    def query_not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("query must not be blank")
+        return v
+
+
+class SearchResult(CodeChunkResponse):
+    """A persisted code chunk plus its similarity score (1.0 = most similar)."""
+
     score: float
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    repository_id: int
-    file_path: str
-    chunk_index: int
-    chunk_type: str
-    symbol_name: Optional[str] = None
-    start_line: int
-    end_line: int
-    content: str

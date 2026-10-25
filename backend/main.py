@@ -1,11 +1,11 @@
-import os
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from dotenv import load_dotenv
 
-from backend.routers import repo
+from backend.config import load_env
 
-load_dotenv()
+load_env()  # explicit, cwd-independent .env path; must run before the modules below read the environment
+
+from backend.routers import repo  # noqa: E402
 
 app = FastAPI(title="RepoPilot Backend")
 

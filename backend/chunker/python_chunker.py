@@ -1,9 +1,14 @@
 import os
-from typing import List, Dict, Any
-from backend.parser.python_ast import extract_definitions
+from typing import List, Dict, Any, Optional
+from backend.parser.python_ast import extract_definitions, relative_posix_path
 
 
-def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 15) -> List[Dict[str, Any]]:
+def chunk_file(
+    file_path: str,
+    max_chunk_lines: int = 100,
+    overlap_lines: int = 15,
+    repo_root: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """Chunks a single Python source file into semantic and windowed snippets.
 
     Chunking Strategy:
@@ -11,6 +16,10 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
     2. Extract whole definitions as discrete chunks when within max_chunk_lines.
     3. If a definition exceeds max_chunk_lines, split it using sliding window with line overlap.
     4. Capture top-level standalone code (e.g., imports, constants, setup) outside definitions.
+
+    ``file_path`` in the returned chunks is relative to ``repo_root`` with ``/``
+    separators (file name only if ``repo_root`` is omitted); it never depends on the
+    process working directory.
 
     Returns a list of dicts:
         {
@@ -35,8 +44,10 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
     if not lines:
         return []
 
+    rel_path = relative_posix_path(file_path, repo_root)
+
     try:
-        definitions = extract_definitions(file_path)
+        definitions = extract_definitions(file_path, repo_root)
     except Exception:
         # If parsing fails (e.g. syntax error), fall back to sliding-window line chunking
         definitions = []
@@ -62,7 +73,7 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
             if content.strip():
                 chunks.append(
                     {
-                        "file_path": os.path.relpath(file_path),
+                        "file_path": rel_path,
                         "chunk_index": chunk_index,
                         "chunk_type": d["type"],
                         "symbol_name": d["name"],
@@ -81,7 +92,7 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
                 if sub_content.strip():
                     chunks.append(
                         {
-                            "file_path": os.path.relpath(file_path),
+                            "file_path": rel_path,
                             "chunk_index": chunk_index,
                             "chunk_type": f"{d['type']}_slice",
                             "symbol_name": d["name"],
@@ -121,7 +132,7 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
         if range_len <= max_chunk_lines:
             chunks.append(
                 {
-                    "file_path": os.path.relpath(file_path),
+                    "file_path": rel_path,
                     "chunk_index": chunk_index,
                     "chunk_type": "module_level",
                     "symbol_name": None,
@@ -139,7 +150,7 @@ def chunk_file(file_path: str, max_chunk_lines: int = 100, overlap_lines: int = 
                 if sub_content.strip():
                     chunks.append(
                         {
-                            "file_path": os.path.relpath(file_path),
+                            "file_path": rel_path,
                             "chunk_index": chunk_index,
                             "chunk_type": "module_level_slice",
                             "symbol_name": None,
@@ -170,7 +181,7 @@ def chunk_repository(repo_root: str, max_chunk_lines: int = 100, overlap_lines: 
         for fname in filenames:
             if fname.endswith(".py"):
                 full_path = os.path.join(dirpath, fname)
-                file_chunks = chunk_file(full_path, max_chunk_lines, overlap_lines)
+                file_chunks = chunk_file(full_path, max_chunk_lines, overlap_lines, repo_root)
                 for chunk in file_chunks:
                     chunk["chunk_index"] = global_index
                     global_index += 1

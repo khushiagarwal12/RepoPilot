@@ -18,3 +18,10 @@ node_modules/
 test_repo_pipeline.db
 repo_data/
 chroma_store/
+
+# Local ChromaDB data (old default ./chroma, current default ./chroma_store)
+chroma/
+chroma_store/
+# Local SQLite databases (development/tests)
+*.sqlite3
+repopilot.db

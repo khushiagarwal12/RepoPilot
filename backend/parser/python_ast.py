@@ -1,6 +1,6 @@
 import ast
 import os
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 
 class DefinitionVisitor(ast.NodeVisitor):
@@ -52,13 +52,27 @@ class DefinitionVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def extract_definitions(file_path: str) -> List[Dict]:
+def relative_posix_path(file_path: str, repo_root: Optional[str] = None) -> str:
+    """Path of ``file_path`` relative to ``repo_root`` using ``/`` separators.
+
+    Independent of the process working directory. When ``repo_root`` is omitted
+    (single-file use) only the file name is returned.
+    """
+    if repo_root is None:
+        return os.path.basename(file_path)
+    return os.path.relpath(file_path, repo_root).replace(os.sep, "/")
+
+
+def extract_definitions(file_path: str, repo_root: Optional[str] = None) -> List[Dict]:
     """Parse a single ``.py`` file and return top‑level definitions.
 
     Parameters
     ----------
     file_path:
         Absolute path to a Python source file.
+    repo_root:
+        Repository root used to compute the stored ``file`` path (relative,
+        ``/``-separated). If omitted, only the file name is stored.
 
     Returns
     -------
@@ -74,15 +88,15 @@ def extract_definitions(file_path: str) -> List[Dict]:
     visitor.visit(tree)
     # Attach file information to each definition
     for d in visitor.definitions:
-        d["file"] = os.path.relpath(file_path)
+        d["file"] = relative_posix_path(file_path, repo_root)
     return visitor.definitions
 
 
 def parse_repository(repo_root: str) -> List[Dict]:
     """Recursively walk *repo_root* and extract definitions from all ``.py`` files.
 
-    The returned list is flat – each entry contains the relative file path and
-    metadata about the definition.
+    The returned list is flat – each entry contains the file path relative to
+    ``repo_root`` (``/``-separated) and metadata about the definition.
     """
     results: List[Dict] = []
     for dirpath, _dirnames, filenames in os.walk(repo_root):
@@ -90,8 +104,10 @@ def parse_repository(repo_root: str) -> List[Dict]:
             if fname.endswith(".py"):
                 full_path = os.path.join(dirpath, fname)
                 try:
-                    results.extend(extract_definitions(full_path))
-                except SyntaxError:
-                    # Skip files that cannot be parsed (e.g. generated stubs)
+                    results.extend(extract_definitions(full_path, repo_root))
+                except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, OSError):
+                    # Skip files that cannot be read or parsed (syntax errors, non-UTF-8
+                    # bytes, null bytes, pathological nesting) so one bad file cannot
+                    # fail the ingestion of the whole repository.
                     continue
     return results

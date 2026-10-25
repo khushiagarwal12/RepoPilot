@@ -1,11 +1,16 @@
 import os
 from logging.config import fileConfig
+from pathlib import Path
 from sqlalchemy import engine_from_config, pool
 from alembic import context
 from dotenv import load_dotenv
 
-# Load .env variables (POSTGRES_URL) if present
-load_dotenv()
+# Load .env (POSTGRES_URL) from an explicit location instead of searching:
+# REPOPILOT_ENV_FILE if set, else <project root>/.env. Never depends on the cwd.
+_env_override = os.getenv("REPOPILOT_ENV_FILE")
+_env_file = Path(_env_override) if _env_override else Path(__file__).resolve().parents[1] / ".env"
+if _env_file.is_file():
+    load_dotenv(dotenv_path=_env_file, override=False)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
