@@ -41,7 +41,8 @@ def safe_extract_zip(zip_file: zipfile.ZipFile, target_dir: str):
     Rejects path traversal, absolute paths, oversized archives, and
     excessive file counts. Symbolic links are skipped.
     """
-    abs_target_dir = os.path.abspath(target_dir)
+
+
     total_uncompressed_size = 0
 
     infolist = zip_file.infolist()
@@ -100,41 +101,8 @@ def safe_extract_zip(zip_file: zipfile.ZipFile, target_dir: str):
     2. Decompression bombs (excessive bytes or file count)
     3. Symlink / hardlink security risks (arbitrary file overwrite)
     """
-    abs_target_dir = os.path.abspath(target_dir)
-    total_uncompressed_size = 0
-    file_count = 0
 
-    infolist = zip_file.infolist()
-    if len(infolist) > MAX_FILE_COUNT:
-        raise ValueError(f"Archive contains too many entries ({len(infolist)} > {MAX_FILE_COUNT})")
 
-    for member in infolist:
-        file_count += 1
-        total_uncompressed_size += member.file_size
-        if total_uncompressed_size > MAX_UNCOMPRESSED_BYTES:
-            raise ValueError(
-                f"Archive uncompressed size exceeds limit of {MAX_UNCOMPRESSED_BYTES / (1024 * 1024):.0f} MB"
-            )
-
-        # Disallow symlinks to prevent arbitrary file pointing/traversal
-        if is_symlink_member(member):
-            raise ValueError(f"Malicious archive detected: '{member.filename}' is a symbolic link.")
-
-        # Clean normalized member path
-        norm_name = member.filename.replace("\\", "/")
-        # Reject absolute paths (e.g. /etc/passwd or C:/evil)
-        if norm_name.startswith("/") or (len(norm_name) > 1 and norm_name[1] == ":"):
-            raise ValueError(f"Malicious archive detected: '{member.filename}' contains an absolute path.")
-
-        # Resolve full destination path
-        dest_path = os.path.abspath(os.path.join(abs_target_dir, norm_name))
-
-        # Check path traversal
-        if not (dest_path == abs_target_dir or dest_path.startswith(abs_target_dir + os.sep)):
-            raise ValueError(f"Malicious archive detected: '{member.filename}' escapes target extraction directory.")
-
-    # All checks passed: safe to extract
-    zip_file.extractall(abs_target_dir)
 
 
 def download_and_extract_repo(github_url: str, target_dir: str) -> str:
