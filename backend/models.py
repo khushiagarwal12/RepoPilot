@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 import enum
-from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Text, Boolean, DateTime, ForeignKey, Enum, Index, text
 from sqlalchemy.orm import relationship
 from backend.database import Base
 
@@ -15,7 +15,7 @@ class JobStatus(str, enum.Enum):
 class Repository(Base):
     __tablename__ = "repositories"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     github_url = Column(Text, nullable=False, unique=True)
     name = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -30,7 +30,7 @@ class Repository(Base):
 class IngestionJob(Base):
     __tablename__ = "ingestion_jobs"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False)
     status = Column(Enum("pending", "running", "succeeded", "failed", name="job_status"), nullable=False, default="pending")
     started_at = Column(DateTime(timezone=True), nullable=True)
@@ -39,11 +39,22 @@ class IngestionJob(Base):
 
     repository = relationship("Repository", back_populates="jobs")
 
+    __table_args__ = (
+        # Database-enforced guard: at most one pending/running job per repository.
+        Index(
+            "uq_ingestion_jobs_one_active_per_repo",
+            "repository_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending', 'running')"),
+            sqlite_where=text("status IN ('pending', 'running')"),
+        ),
+    )
+
 
 class CodeDefinition(Base):
     __tablename__ = "code_definitions"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(Text, nullable=False)
     name = Column(Text, nullable=False, index=True)
@@ -58,7 +69,7 @@ class CodeDefinition(Base):
 class CodeChunk(Base):
     __tablename__ = "code_chunks"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"), nullable=False, index=True)
     file_path = Column(Text, nullable=False)
     chunk_index = Column(Integer, nullable=False)

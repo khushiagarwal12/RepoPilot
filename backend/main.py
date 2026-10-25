@@ -1,3 +1,6 @@
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -7,7 +10,21 @@ load_env()  # explicit, cwd-independent .env path; must run before the modules b
 
 from backend.routers import repo  # noqa: E402
 
-app = FastAPI(title="RepoPilot Backend")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        recovered = repo.recover_interrupted_jobs()
+        if recovered:
+            logger.warning("Marked %d interrupted ingestion job(s) as failed", recovered)
+    except Exception as exc:  # noqa: BLE001 - startup must not crash, but the cause is logged
+        logger.error("Could not recover interrupted jobs: %s", type(exc).__name__)
+    yield
+
+
+app = FastAPI(title="RepoPilot Backend", lifespan=lifespan)
 
 # Register routers
 app.include_router(repo.router)

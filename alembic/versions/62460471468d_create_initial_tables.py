@@ -51,3 +51,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("ingestion_jobs")
     op.drop_table("repositories")
+    # PostgreSQL keeps the enum type after its table is dropped; remove it so
+    # "downgrade base" followed by "upgrade head" works.
+    sa.Enum(name="job_status").drop(op.get_bind(), checkfirst=True)

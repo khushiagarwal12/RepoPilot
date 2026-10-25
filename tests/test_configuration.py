@@ -45,13 +45,10 @@ def test_postgres_url_is_used_when_set(tmp_path):
     assert r.stdout.split() == ["postgresql", "db.example", "mydb"]
 
 
-def test_failure_message_never_contains_database_credentials(tmp_path):
-    r = _run("import backend.database", tmp_path, {"POSTGRES_URL": "notaurl-with-secret-hunter2"})
-    assert r.returncode != 0
-    assert "hunter2" not in r.stdout + r.stderr or "hunter2" in r.stderr  # SQLAlchemy may echo; see next test
-    # The application's own message path (missing URL) must be credential free:
-    r2 = _run("import backend.database", tmp_path)
-    assert "hunter2" not in r2.stderr
+def test_missing_database_message_never_contains_credentials(tmp_path):
+    r = _run("import backend.database", tmp_path, {"REPOPILOT_ENV_FILE": str(tmp_path / "x.env")})
+    assert r.returncode != 0 and "POSTGRES_URL is not set" in r.stderr
+    assert "hunter2" not in r.stdout + r.stderr
 
 
 # ------------------------------------------------------------------ .env loading

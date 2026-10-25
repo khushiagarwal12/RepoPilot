@@ -6,6 +6,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from backend import vector_store
@@ -157,6 +158,26 @@ def process_repository_ingestion(repo_id: int, job_id: int, github_url: str, db_
         db.close()
 
 
+def recover_interrupted_jobs(db_factory=SessionLocal) -> int:
+    """Mark pending/running jobs as failed. Call once at startup.
+
+    Ingestion runs in this process's background tasks, so after a restart no such
+    job can still be running; leaving them active would block re-indexing forever.
+    (Assumes a single API process; revisit if you run several workers.)
+    """
+    db = db_factory()
+    try:
+        jobs = db.query(IngestionJob).filter(IngestionJob.status.in_(["pending", "running"])).all()
+        for job in jobs:
+            job.status = "failed"
+            job.finished_at = datetime.now(timezone.utc)
+            job.log = "Interrupted: the server restarted before this job finished. Submit the repository again."
+        db.commit()
+        return len(jobs)
+    finally:
+        db.close()
+
+
 @router.post("/", response_model=IngestResponse)
 def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     url_str = str(payload.github_url).rstrip("/")
@@ -172,8 +193,15 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
             name=f"{owner}/{repo_name}",
         )
         db.add(repo)
-        db.commit()
-        db.refresh(repo)
+        try:
+            db.commit()
+        except IntegrityError:  # another request created the same repository first
+            db.rollback()
+            repo = db.query(Repository).filter(Repository.github_url == url_str).first()
+            if repo is None:
+                raise
+        else:
+            db.refresh(repo)
 
     # Guard against concurrent duplicate execution
     active_job = (
@@ -190,7 +218,24 @@ def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTas
 
     job = IngestionJob(repository_id=repo.id, status="pending")
     db.add(job)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # The database allows only one pending/running job per repository, so a
+        # concurrent request won the race: report that job instead of failing.
+        db.rollback()
+        active_job = (
+            db.query(IngestionJob)
+            .filter(IngestionJob.repository_id == repo.id, IngestionJob.status.in_(["pending", "running"]))
+            .first()
+        )
+        if active_job is None:
+            raise
+        return IngestResponse(
+            repository_id=repo.id,
+            job_id=active_job.id,
+            message=f"An ingestion job (#{active_job.id}) is already {active_job.status} for this repository.",
+        )
     db.refresh(job)
 
     background_tasks.add_task(process_repository_ingestion, repo.id, job.id, url_str)
