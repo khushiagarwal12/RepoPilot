@@ -30,3 +30,5 @@ repopilot.db
 frontend/node_modules/
 frontend/dist/
 frontend/.env
+
+.venv-validation/

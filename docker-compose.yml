@@ -28,7 +28,7 @@ services:
       POSTGRES_URL: "postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/repopilot"
       CHROMA_DB_PATH: /data/chroma_store
       HF_HOME: /data/hf_cache
-      CORS_ORIGINS: "http://localhost:8080"
+      CORS_ORIGINS: "http://localhost:8081"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       LLM_MODEL: "${LLM_MODEL:-gemini-2.5-flash}"
       LLM_PROVIDER: "${LLM_PROVIDER:-gemini}"
@@ -59,7 +59,7 @@ services:
     depends_on:
       - api
     ports:
-      - "8080:80"
+      - "8081:80"
 
 volumes:
   pg_data:

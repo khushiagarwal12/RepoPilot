@@ -1,0 +1,641 @@
+From d28a1ace887ca36f42f420a4742da0236e34fdaf Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:46:48 +0000
+Subject: [PATCH] LLM: configurable primary/fallback providers (Gemini,
+ OpenRouter) with bounded retries
+
+---
+ .env.example                |  14 +-
+ README.md                   |  11 +-
+ backend/config.py           |  11 ++
+ backend/llm.py              | 190 ++++++++++++++++++++++++-
+ docker-compose.yml          |   4 +
+ docs/ASK_DESIGN.md          |   2 +-
+ tests/test_llm_providers.py | 277 ++++++++++++++++++++++++++++++++++++
+ 7 files changed, 498 insertions(+), 11 deletions(-)
+ create mode 100644 tests/test_llm_providers.py
+
+diff --git a/.env.example b/.env.example
+index 0415863..1d0428c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -6,8 +6,18 @@ POSTGRES_URL=postgresql://postgres:postgres@localhost:5432/repopilot
+ # REPOPILOT_ALLOW_SQLITE=1
+ # Optional: load a different env file than <project>/.env
+ # REPOPILOT_ENV_FILE=C:\path\to\other.env
+-# /ask (Google Gemini)
++# /ask LLM. Primary provider (default gemini). Keys live ONLY in your local .env, never in git.
+ GEMINI_API_KEY=YOUR_GEMINI_KEY
+-# LLM_MODEL=gemini-2.5-flash
++# LLM_PROVIDER=gemini                     # gemini | openrouter
++# LLM_MODEL=gemini-2.5-flash              # model of the primary provider
++# Optional automatic fallback, used when the primary fails after its retries (or is misconfigured):
++# LLM_FALLBACK_PROVIDER=openrouter
++# LLM_FALLBACK_MODEL=google/gemini-2.5-flash
++# OPENROUTER_API_KEY=YOUR_OPENROUTER_KEY
++# Retries (HTTP 429/503 and timeouts only; exponential backoff 1s,2s,4s... capped):
++# LLM_MAX_RETRIES=2
++# LLM_RETRY_BASE_SECONDS=1.0
++# LLM_RETRY_MAX_SECONDS=8.0
++# LLM_TOTAL_TIMEOUT_SECONDS=120
+ # ASK_MIN_SCORE=0.20
+ # LLM_TIMEOUT_SECONDS=45
+diff --git a/README.md b/README.md
+index 95b66d5..c56c8c6 100644
+--- a/README.md
++++ b/README.md
+@@ -46,7 +46,16 @@ python scratch/ingest_test.py --timeout 600  # real end-to-end ingest against a
+ ```
+ 
+ ## Configuration
+-`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_MODEL`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
++`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_MODEL`, `OPENROUTER_API_KEY`, `LLM_MAX_RETRIES`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
++
++## LLM providers, retries and fallback
++`/ask` uses Google Gemini by default (`GEMINI_API_KEY`). To add an automatic fallback through [OpenRouter](https://openrouter.ai), put these in your **local** `.env` (never commit keys):
++```
++OPENROUTER_API_KEY=<your key>
++LLM_FALLBACK_PROVIDER=openrouter
++LLM_FALLBACK_MODEL=google/gemini-2.5-flash
++```
++Behaviour: HTTP 429/503 and timeouts are retried with exponential backoff (`LLM_MAX_RETRIES`, default 2 retries: 1 s, 2 s, ...). Authentication errors and other client errors are **not** retried. If the primary still fails, or its key is missing/invalid, the fallback is tried (with the same retry rules). If both fail, `/ask` returns a sanitized 503 listing each provider's failure. The evidence gate and citation validation run exactly the same whichever provider answered; `model` in the response shows which one did. You can also swap roles (`LLM_PROVIDER=openrouter`, `LLM_FALLBACK_PROVIDER=gemini`).
+ 
+ ## Limitations
+ Python files only; single API process (interrupted jobs are marked failed at startup); no authentication; in-memory rate limiter; embedding model truncates long chunks; answers are stateless (no chat history); `ASK_MIN_SCORE` needs calibration with real queries.
+diff --git a/backend/config.py b/backend/config.py
+index 9af4d3b..34e2013 100644
+--- a/backend/config.py
++++ b/backend/config.py
+@@ -60,6 +60,17 @@ def get_repo_data_dir() -> Path:
+     return PROJECT_ROOT / "repo_data"
+ 
+ 
++def int_env(name: str, default: int) -> int:
++    try:
++        return int(os.getenv(name, default))
++    except ValueError:
++        return default
++
++
++def float_env(name: str, default: float) -> float:
++    return _float_env(name, default)
++
++
+ def _float_env(name: str, default: float) -> float:
+     try:
+         return float(os.getenv(name, default))
+diff --git a/backend/llm.py b/backend/llm.py
+index 17954cc..97dbe78 100644
+--- a/backend/llm.py
++++ b/backend/llm.py
+@@ -1,19 +1,38 @@
+ """Minimal LLM client interface plus a Gemini REST adapter (no extra SDK dependency)."""
+ from __future__ import annotations
+ 
++import logging
+ import os
+-from typing import Optional, Protocol
++import random
++import time
++from typing import Callable, List, Optional, Protocol
+ 
+ import requests
+ 
+-from backend.config import get_llm_model, get_llm_timeout
++from backend.config import get_llm_model, get_llm_timeout, int_env, float_env
+ from backend.utils.errors import sanitize_error
+ 
+ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+ 
+ 
++logger = logging.getLogger(__name__)
++
++# HTTP statuses worth retrying: rate limit and temporary unavailability. Auth errors (401/403),
++# bad requests (400/404) and everything else are permanent and are never retried.
++TRANSIENT_STATUS = frozenset({429, 503})
++OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
++DEFAULT_MODELS = {"gemini": "gemini-2.5-flash", "openrouter": "google/gemini-2.5-flash"}
++
++
+ class LLMError(RuntimeError):
+-    """The LLM could not produce a usable answer (not configured, timeout, HTTP error, blocked, truncated)."""
++    """The LLM could not produce a usable answer (not configured, timeout, HTTP error, blocked, truncated).
++
++    ``transient`` is True only for failures that may succeed if retried (HTTP 429/503, timeouts).
++    """
++
++    def __init__(self, message: str, transient: bool = False):
++        super().__init__(message)
++        self.transient = transient
+ 
+ 
+ class LLMClient(Protocol):
+@@ -23,6 +42,8 @@ class LLMClient(Protocol):
+ 
+ 
+ class GeminiClient:
++    provider = "gemini"
++
+     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None,
+                  timeout: Optional[float] = None, max_output_tokens: int = 1024):
+         self.api_key = api_key if api_key is not None else os.getenv("GEMINI_API_KEY")
+@@ -50,19 +71,19 @@ class GeminiClient:
+                 timeout=(10, self.timeout),
+             )
+         except requests.Timeout as exc:
+-            raise LLMError("LLM request timed out.") from exc
++            raise LLMError("LLM request timed out.", transient=True) from exc
+         except requests.RequestException as exc:
+             raise LLMError(f"Could not reach the LLM service: {type(exc).__name__}") from exc
+ 
+         if resp.status_code == 429:
+-            raise LLMError("LLM rate limit or quota exceeded (HTTP 429).")
++            raise LLMError("LLM rate limit or quota exceeded (HTTP 429).", transient=True)
+         if resp.status_code != 200:
+             detail = ""
+             try:
+                 detail = str(resp.json().get("error", {}).get("message", ""))[:200]
+             except ValueError:
+                 pass
+-            raise LLMError(f"LLM request failed (HTTP {resp.status_code}). {sanitize_error(RuntimeError(detail))[len('RuntimeError: '):]}".strip())
++            raise LLMError(f"LLM request failed (HTTP {resp.status_code}). {sanitize_error(RuntimeError(detail))[len('RuntimeError: '):]}".strip(), transient=resp.status_code in TRANSIENT_STATUS)
+ 
+         try:
+             data = resp.json()
+@@ -83,6 +104,161 @@ class GeminiClient:
+         return text
+ 
+ 
++class OpenRouterClient:
++    """OpenRouter (OpenAI-compatible chat completions) adapter."""
++
++    provider = "openrouter"
++
++    def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None,
++                 timeout: Optional[float] = None, max_output_tokens: int = 1024):
++        self.api_key = api_key if api_key is not None else os.getenv("OPENROUTER_API_KEY")
++        self.model = model or DEFAULT_MODELS["openrouter"]
++        self.timeout = timeout if timeout is not None else get_llm_timeout()
++        self.max_output_tokens = max_output_tokens
++
++    def complete(self, system: str, user: str) -> str:
++        if not self.api_key or self.api_key.startswith("YOUR_"):
++            raise LLMError("LLM is not configured: set OPENROUTER_API_KEY in your .env file.")
++        body = {
++            "model": self.model,
++            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
++            "temperature": 0,
++            "max_tokens": self.max_output_tokens,
++        }
++        try:
++            resp = requests.post(
++                OPENROUTER_URL,
++                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
++                json=body,
++                timeout=(10, self.timeout),
++            )
++        except requests.Timeout as exc:
++            raise LLMError("LLM request timed out.", transient=True) from exc
++        except requests.RequestException as exc:
++            raise LLMError(f"Could not reach the LLM service: {type(exc).__name__}") from exc
++
++        if resp.status_code != 200:
++            detail = ""
++            try:
++                detail = str((resp.json().get("error") or {}).get("message", ""))[:200]
++            except (ValueError, AttributeError):
++                pass
++            kind = "rate limit or quota exceeded" if resp.status_code == 429 else "request failed"
++            msg = f"LLM {kind} (HTTP {resp.status_code}). {sanitize_error(RuntimeError(detail))[len('RuntimeError: '):]}".strip()
++            raise LLMError(msg, transient=resp.status_code in TRANSIENT_STATUS)
++        try:
++            data = resp.json()
++        except ValueError as exc:
++            raise LLMError("LLM returned a non-JSON response.") from exc
++        choices = data.get("choices") or []
++        if not choices:
++            err = data.get("error") or {}
++            code = err.get("code")
++            raise LLMError("LLM returned no choices.", transient=isinstance(code, int) and code in TRANSIENT_STATUS)
++        choice = choices[0]
++        if choice.get("finish_reason") not in (None, "stop"):
++            raise LLMError(f"LLM did not finish normally ({choice.get('finish_reason')}).")
++        text = ((choice.get("message") or {}).get("content") or "").strip()
++        if not text:
++            raise LLMError("LLM returned an empty answer.")
++        return text
++
++
++class _BrokenClient:
++    """Stands in for a misconfigured provider so the failure is reported, not raised at startup."""
++
++    def __init__(self, provider: str, model: str, error: LLMError):
++        self.provider, self.model, self._error = provider, model, error
++
++    def complete(self, system: str, user: str) -> str:
++        raise self._error
++
++
++def _label(client) -> str:
++    return f"{getattr(client, 'provider', 'llm')}/{getattr(client, 'model', '?')}"
++
++
++class ResilientLLM:
++    """Primary client with bounded exponential-backoff retries, then an optional fallback client.
++
++    * Only transient errors (HTTP 429/503, timeouts) are retried, at most ``max_retries`` times.
++    * Any primary failure (retries exhausted, invalid or missing key, permanent error) moves on to the fallback.
++    * If every client fails, one controlled ``LLMError`` summarising each failure is raised.
++    * ``model`` reflects the client that actually answered.
++    """
++
++    def __init__(self, clients: List, max_retries: int = 2, base_delay: float = 1.0, max_delay: float = 8.0,
++                 total_timeout: float = 120.0, sleep: Optional[Callable[[float], None]] = None,
++                 monotonic: Callable[[], float] = time.monotonic, rng: Callable[[], float] = random.random):
++        if not clients:
++            raise ValueError("ResilientLLM needs at least one client")
++        self.clients = clients
++        self.model = clients[0].model
++        self.max_retries, self.base_delay, self.max_delay = max(0, max_retries), base_delay, max_delay
++        self.total_timeout = total_timeout
++        self._sleep, self._monotonic, self._rng = sleep, monotonic, rng
++
++    def _call_with_retries(self, client, system: str, user: str, started: float) -> str:
++        attempt = 0
++        while True:
++            try:
++                return client.complete(system, user)
++            except LLMError as exc:
++                if not exc.transient or attempt >= self.max_retries:
++                    raise
++                delay = min(self.max_delay, self.base_delay * (2 ** attempt))
++                delay *= 1 + 0.2 * (self._rng() * 2 - 1)  # +/-20% jitter
++                if self._monotonic() - started + delay > self.total_timeout:
++                    raise  # time budget exhausted: stop retrying
++                logger.warning("LLM %s transient failure, retry %d/%d in %.1fs", _label(client),
++                               attempt + 1, self.max_retries, delay)
++                (self._sleep or time.sleep)(delay)
++                attempt += 1
++
++    def complete(self, system: str, user: str) -> str:
++        started = self._monotonic()
++        failures = []
++        for i, client in enumerate(self.clients):
++            try:
++                text = self._call_with_retries(client, system, user, started)
++                self.model = client.model
++                if i:
++                    logger.warning("LLM answered by fallback %s", _label(client))
++                return text
++            except LLMError as exc:
++                if len(self.clients) == 1:
++                    raise
++                failures.append(f"{_label(client)}: {exc}")
++                logger.warning("LLM %s failed (%s)", _label(client), "transient" if exc.transient else "permanent")
++        raise LLMError("All configured LLM providers failed. " + " | ".join(failures))
++
++
++def _build_client(provider: str, model: Optional[str]):
++    provider = (provider or "").strip().lower()
++    if provider == "gemini":
++        return GeminiClient(model=model or DEFAULT_MODELS["gemini"])
++    if provider == "openrouter":
++        return OpenRouterClient(model=model or DEFAULT_MODELS["openrouter"])
++    return _BrokenClient(provider or "?", model or "?", LLMError(
++        f"Unknown LLM provider '{provider}'. Supported: gemini, openrouter."))
++
++
++def build_llm_from_env() -> ResilientLLM:
++    """LLM_PROVIDER/LLM_MODEL = primary (default gemini); LLM_FALLBACK_PROVIDER/LLM_FALLBACK_MODEL = optional fallback."""
++    primary = _build_client(os.getenv("LLM_PROVIDER") or "gemini", os.getenv("LLM_MODEL") or None)
++    clients = [primary]
++    fb_provider = (os.getenv("LLM_FALLBACK_PROVIDER") or "").strip()
++    if fb_provider:
++        clients.append(_build_client(fb_provider, os.getenv("LLM_FALLBACK_MODEL") or None))
++    return ResilientLLM(
++        clients,
++        max_retries=int_env("LLM_MAX_RETRIES", 2),
++        base_delay=float_env("LLM_RETRY_BASE_SECONDS", 1.0),
++        max_delay=float_env("LLM_RETRY_MAX_SECONDS", 8.0),
++        total_timeout=float_env("LLM_TOTAL_TIMEOUT_SECONDS", 120.0),
++    )
++
++
+ def get_llm_client() -> LLMClient:
+     """FastAPI dependency (overridden in tests). Constructing it never fails; calling it may."""
+-    return GeminiClient()
++    return build_llm_from_env()
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 6574c62..acdcac6 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -31,6 +31,10 @@ services:
+       CORS_ORIGINS: "http://localhost:8080"
+       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+       LLM_MODEL: "${LLM_MODEL:-gemini-2.5-flash}"
++      LLM_PROVIDER: "${LLM_PROVIDER:-gemini}"
++      LLM_FALLBACK_PROVIDER: "${LLM_FALLBACK_PROVIDER:-}"
++      LLM_FALLBACK_MODEL: "${LLM_FALLBACK_MODEL:-}"
++      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+       ASK_MIN_SCORE: "${ASK_MIN_SCORE:-0.20}"
+       RETRIEVAL_MODE: "${RETRIEVAL_MODE:-vector}"
+     ports:
+diff --git a/docs/ASK_DESIGN.md b/docs/ASK_DESIGN.md
+index 649c8d4..5ad0715 100644
+--- a/docs/ASK_DESIGN.md
++++ b/docs/ASK_DESIGN.md
+@@ -28,7 +28,7 @@ Errors: 404 unknown repo, 409 not indexed, 422 bad input, 503 embedding/vector/L
+ - LLM failure/timeout -> 503, never a partial or invented answer.
+ 
+ ## Config
+-`GEMINI_API_KEY`, `LLM_MODEL` (default gemini-2.5-flash), `LLM_TIMEOUT_SECONDS` (45), `ASK_MIN_SCORE` (0.20). Only a Gemini adapter exists; add another class with `complete(system, user)` for other providers.
++`LLM_PROVIDER`/`LLM_MODEL` (primary, default gemini / gemini-2.5-flash), optional `LLM_FALLBACK_PROVIDER`/`LLM_FALLBACK_MODEL`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `LLM_MAX_RETRIES`, `LLM_RETRY_BASE_SECONDS`, `LLM_RETRY_MAX_SECONDS`, `LLM_TOTAL_TIMEOUT_SECONDS`, `LLM_TIMEOUT_SECONDS` (45), `ASK_MIN_SCORE` (0.20). Adapters: Gemini and OpenRouter, wrapped by `ResilientLLM` (retry on 429/503/timeouts, then fallback). Add another provider with a class exposing `complete(system, user)`, `provider` and `model`.
+ 
+ ## Tests to write
+ Fake-LLM answered path with valid citations; invalid/missing citations -> insufficient; gate blocks LLM call (assert not called); injection fixture in a chunk is ignored; LLM timeout/error -> 503; repo scoping; schema/OpenAPI.
+diff --git a/tests/test_llm_providers.py b/tests/test_llm_providers.py
+new file mode 100644
+index 0000000..e280067
+--- /dev/null
++++ b/tests/test_llm_providers.py
+@@ -0,0 +1,277 @@
++"""Provider selection, bounded retries, fallback, and grounding preserved through the fallback path."""
++import pytest
++
++import backend.llm as llm_mod
++from backend.llm import (GeminiClient, LLMError, OpenRouterClient, ResilientLLM, TRANSIENT_STATUS,
++                         build_llm_from_env, get_llm_client)
++from backend.main import app
++from tests.test_ask import Q, Resp, ask, env  # noqa: F401  (fixtures + helpers)
++
++KEY = "k-secret-123456"
++
++
++def _or_ok(text="hi [1]", finish="stop"):
++    return Resp(200, {"choices": [{"message": {"content": text}, "finish_reason": finish}]})
++
++
++class Scripted:
++    """Fake LLMClient: pops outcomes (str -> reply, LLMError -> raised)."""
++
++    def __init__(self, provider, model, outcomes):
++        self.provider, self.model, self.outcomes, self.calls = provider, model, list(outcomes), 0
++
++    def complete(self, system, user):
++        self.calls += 1
++        out = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
++        if isinstance(out, LLMError):
++            raise out
++        return out
++
++
++T = lambda m="HTTP 503": LLMError(m, transient=True)  # noqa: E731
++P = lambda m="HTTP 401": LLMError(m)  # noqa: E731
++
++
++def resilient(*clients, **kw):
++    sleeps = []
++    kw.setdefault("rng", lambda: 0.5)  # no jitter
++    r = ResilientLLM(list(clients), sleep=sleeps.append, **kw)
++    r.sleeps = sleeps
++    return r
++
++
++# ------------------------------------------------------------------ OpenRouter adapter
++def test_openrouter_request_shape_and_parsing(monkeypatch):
++    seen = {}
++
++    def post(url, headers=None, json=None, timeout=None):
++        seen.update(url=url, headers=headers, body=json, timeout=timeout)
++        return _or_ok("answer [1]")
++
++    monkeypatch.setattr(llm_mod.requests, "post", post)
++    assert OpenRouterClient(api_key=KEY, model="google/gemini-2.5-flash", timeout=7).complete("SYS", "USER") == "answer [1]"
++    assert seen["url"] == "https://openrouter.ai/api/v1/chat/completions" and KEY not in seen["url"]
++    assert seen["headers"]["Authorization"] == f"Bearer {KEY}" and seen["timeout"] == (10, 7)
++    assert seen["body"]["temperature"] == 0 and seen["body"]["model"] == "google/gemini-2.5-flash"
++    assert seen["body"]["messages"][0] == {"role": "system", "content": "SYS"}
++
++
++@pytest.mark.parametrize("resp,match,transient", [
++    (Resp(429, {"error": {"message": "slow down"}}), "HTTP 429", True),
++    (Resp(503, {}), "HTTP 503", True),
++    (Resp(401, {"error": {"message": "invalid key"}}), "HTTP 401", False),
++    (Resp(402, {}), "HTTP 402", False),
++    (Resp(400, {}), "HTTP 400", False),
++    (Resp(200, None), "non-JSON", False),
++    (Resp(200, {"choices": []}), "no choices", False),
++    (Resp(200, {"error": {"code": 503}}), "no choices", True),
++    (_or_ok(finish="length"), "did not finish", False),
++    (_or_ok(text=""), "empty", False),
++])
++def test_openrouter_failure_classification(monkeypatch, resp, match, transient):
++    monkeypatch.setattr(llm_mod.requests, "post", lambda *a, **k: resp)
++    with pytest.raises(LLMError, match=match) as e:
++        OpenRouterClient(api_key=KEY).complete("s", "u")
++    assert e.value.transient is transient
++
++
++def test_openrouter_timeout_transient_and_missing_key(monkeypatch):
++    import requests
++
++    def boom(*a, **k):
++        raise requests.ReadTimeout("slow")
++
++    monkeypatch.setattr(llm_mod.requests, "post", boom)
++    with pytest.raises(LLMError) as e:
++        OpenRouterClient(api_key=KEY).complete("s", "u")
++    assert e.value.transient
++    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
++    for key in ("", "YOUR_OPENROUTER_KEY", None):
++        with pytest.raises(LLMError, match="OPENROUTER_API_KEY") as e:
++            OpenRouterClient(api_key=key).complete("s", "u")
++        assert not e.value.transient
++
++
++@pytest.mark.parametrize("status,transient", [(429, True), (503, True), (500, False), (400, False),
++                                              (401, False), (403, False), (404, False)])
++def test_gemini_transient_classification(monkeypatch, status, transient):
++    monkeypatch.setattr(llm_mod.requests, "post", lambda *a, **k: Resp(status, {"error": {"message": "x"}}))
++    with pytest.raises(LLMError) as e:
++        GeminiClient(api_key=KEY).complete("s", "u")
++    assert e.value.transient is transient
++    assert (status in TRANSIENT_STATUS) is transient
++
++
++# ------------------------------------------------------------------ retries
++def test_transient_failure_retries_with_exponential_backoff_then_succeeds():
++    a = Scripted("gemini", "g", [T(), T(), "ok [1]"])
++    r = resilient(a, max_retries=2, base_delay=1.0, max_delay=8.0)
++    assert r.complete("s", "u") == "ok [1]" and a.calls == 3 and r.sleeps == [1.0, 2.0]
++
++
++def test_retries_are_bounded_and_delay_capped():
++    a = Scripted("gemini", "g", [T()])
++    r = resilient(a, max_retries=4, base_delay=1.0, max_delay=3.0)
++    with pytest.raises(LLMError, match="503"):
++        r.complete("s", "u")
++    assert a.calls == 5 and r.sleeps == [1.0, 2.0, 3.0, 3.0]   # 1 + max_retries attempts, capped delays
++
++
++@pytest.mark.parametrize("err", [P("HTTP 401"), P("HTTP 400"), P("HTTP 403"), LLMError("LLM is not configured: x")])
++def test_permanent_errors_are_never_retried(err):
++    a = Scripted("gemini", "g", [err])
++    r = resilient(a, max_retries=3)
++    with pytest.raises(LLMError):
++        r.complete("s", "u")
++    assert a.calls == 1 and r.sleeps == []
++
++
++def test_total_time_budget_stops_retrying():
++    clock = iter([0.0, 100.0, 100.0, 100.0])  # started=0, first retry check sees t=100
++    a = Scripted("gemini", "g", [T()])
++    r = ResilientLLM([a], max_retries=5, base_delay=1.0, total_timeout=10.0, sleep=lambda s: None,
++                     monotonic=lambda: next(clock), rng=lambda: 0.5)
++    with pytest.raises(LLMError):
++        r.complete("s", "u")
++    assert a.calls == 1
++
++
++# ------------------------------------------------------------------ fallback
++def test_fallback_used_after_primary_retries_exhausted():
++    a, b = Scripted("gemini", "g1", [T()]), Scripted("openrouter", "o1", ["fallback answer [1]"])
++    r = resilient(a, b, max_retries=2)
++    assert r.complete("s", "u") == "fallback answer [1]"
++    assert a.calls == 3 and b.calls == 1 and r.model == "o1"
++
++
++def test_fallback_used_immediately_for_invalid_primary_key_without_retry():
++    a, b = Scripted("gemini", "g1", [P("HTTP 400. API key not valid")]), Scripted("openrouter", "o1", ["ok [1]"])
++    r = resilient(a, b)
++    assert r.complete("s", "u") == "ok [1]" and a.calls == 1 and r.sleeps == []
++
++
++def test_fallback_clients_also_retry_transient_errors():
++    a, b = Scripted("gemini", "g", [P()]), Scripted("openrouter", "o", [T(), "ok [1]"])
++    r = resilient(a, b, max_retries=2)
++    assert r.complete("s", "u") == "ok [1]" and b.calls == 2
++
++
++def test_primary_success_never_touches_fallback():
++    a, b = Scripted("gemini", "g1", ["ok [1]"]), Scripted("openrouter", "o1", ["x"])
++    r = resilient(a, b)
++    assert r.complete("s", "u") == "ok [1]" and b.calls == 0 and r.model == "g1"
++
++
++def test_both_providers_failing_gives_one_controlled_error_without_secrets(monkeypatch):
++    monkeypatch.setenv("OPENROUTER_API_KEY", "or-secret-key-987654")
++    a = Scripted("gemini", "g1", [T("rate limit HTTP 429")])
++    b = Scripted("openrouter", "o1", [P("HTTP 401 or-secret-key-987654")])
++    with pytest.raises(LLMError) as e:
++        resilient(a, b, max_retries=1).complete("s", "u")
++    msg = str(e.value)
++    assert "All configured LLM providers failed" in msg and "gemini/g1" in msg and "openrouter/o1" in msg
++    assert a.calls == 2 and b.calls == 1
++
++
++# ------------------------------------------------------------------ configuration from env
++def _clear(monkeypatch):
++    for k in ("LLM_PROVIDER", "LLM_MODEL", "LLM_FALLBACK_PROVIDER", "LLM_FALLBACK_MODEL", "LLM_MAX_RETRIES",
++              "GEMINI_API_KEY", "OPENROUTER_API_KEY"):
++        monkeypatch.delenv(k, raising=False)
++
++
++def test_default_is_gemini_only_and_backward_compatible(monkeypatch):
++    _clear(monkeypatch)
++    r = build_llm_from_env()
++    assert [(c.provider, c.model) for c in r.clients] == [("gemini", "gemini-2.5-flash")] and r.max_retries == 2
++    with pytest.raises(LLMError, match="GEMINI_API_KEY"):
++        r.complete("s", "u")   # single client: original message preserved
++
++
++def test_env_selects_providers_models_and_retries(monkeypatch):
++    _clear(monkeypatch)
++    monkeypatch.setenv("LLM_PROVIDER", "gemini")
++    monkeypatch.setenv("LLM_MODEL", "gemini-2.5-pro")
++    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "OpenRouter")
++    monkeypatch.setenv("LLM_FALLBACK_MODEL", "meta-llama/llama-3.3-70b-instruct")
++    monkeypatch.setenv("LLM_MAX_RETRIES", "4")
++    r = build_llm_from_env()
++    assert [(c.provider, c.model) for c in r.clients] == [("gemini", "gemini-2.5-pro"),
++                                                          ("openrouter", "meta-llama/llama-3.3-70b-instruct")]
++    assert r.max_retries == 4
++    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
++    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "gemini")
++    monkeypatch.delenv("LLM_FALLBACK_MODEL")
++    assert [(c.provider, c.model) for c in build_llm_from_env().clients][1] == ("gemini", "gemini-2.5-flash")
++
++
++def test_unknown_provider_is_a_controlled_error_not_a_crash(monkeypatch):
++    _clear(monkeypatch)
++    monkeypatch.setenv("LLM_PROVIDER", "nope")
++    with pytest.raises(LLMError, match="Unknown LLM provider 'nope'"):
++        build_llm_from_env().complete("s", "u")
++
++
++def test_missing_keys_on_both_providers(monkeypatch):
++    _clear(monkeypatch)
++    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "openrouter")
++    with pytest.raises(LLMError) as e:
++        build_llm_from_env().complete("s", "u")
++    assert "GEMINI_API_KEY" in str(e.value) and "OPENROUTER_API_KEY" in str(e.value)
++
++
++def test_end_to_end_http_mocked_gemini_503_then_openrouter(monkeypatch):
++    _clear(monkeypatch)
++    monkeypatch.setenv("GEMINI_API_KEY", KEY)
++    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key-123456")
++    monkeypatch.setenv("LLM_FALLBACK_PROVIDER", "openrouter")
++    monkeypatch.setattr(llm_mod.time, "sleep", lambda s: None)
++    urls = []
++
++    def post(url, **kw):
++        urls.append(url.split("/")[2])
++        return Resp(503, {}) if "googleapis" in url else _or_ok("from openrouter [1]")
++
++    monkeypatch.setattr(llm_mod.requests, "post", post)
++    r = get_llm_client()
++    assert r.complete("s", "u") == "from openrouter [1]"
++    assert urls == ["generativelanguage.googleapis.com"] * 3 + ["openrouter.ai"] and r.model == "google/gemini-2.5-flash"
++
++
++# ------------------------------------------------------------------ grounding through the fallback path
++def _use(ask, *clients):
++    llm = resilient(*clients, max_retries=1)
++    app.dependency_overrides[get_llm_client] = lambda: llm
++    return llm
++
++
++def test_fallback_answer_is_grounded_and_cited_from_database(ask):
++    a, b = Scripted("gemini", "g1", [T()]), Scripted("openrouter", "o1", ["It sums prices [1]."])
++    _use(ask, a, b)
++    body = ask().json()
++    assert body["status"] == "answered" and body["model"] == "o1" and a.calls == 2
++    c = body["citations"][0]
++    assert c["chunk_id"] in [r[0] for r in ask.env.chunks(ask.repo_id)] and c["snippet"] and c["start_line"] >= 1
++
++
++@pytest.mark.parametrize("reply", ["No citation here.", "Bogus [42].", "INSUFFICIENT_EVIDENCE"])
++def test_fallback_answers_without_valid_citation_are_rejected(ask, reply):
++    _use(ask, Scripted("gemini", "g1", [T()]), Scripted("openrouter", "o1", [reply]))
++    body = ask().json()
++    assert body["status"] == "insufficient_evidence" and body["answer"] is None and body["citations"] == []
++
++
++def test_evidence_gate_blocks_both_providers(ask, monkeypatch):
++    monkeypatch.setenv("ASK_MIN_SCORE", "0.99")
++    a, b = Scripted("gemini", "g1", ["x [1]"]), Scripted("openrouter", "o1", ["x [1]"])
++    _use(ask, a, b)
++    assert ask("zebra giraffe unrelated").json()["status"] == "insufficient_evidence"
++    assert a.calls == 0 and b.calls == 0
++
++
++def test_both_failing_returns_sanitized_503(ask, monkeypatch):
++    monkeypatch.setenv("GEMINI_API_KEY", "AIza-secret-key-123456")
++    _use(ask, Scripted("gemini", "g1", [T("HTTP 503 AIza-secret-key-123456")]), Scripted("openrouter", "o1", [P("HTTP 401")]))
++    res = ask()
++    assert res.status_code == 503 and "LLM unavailable" in res.json()["detail"]
++    assert "AIza-secret" not in res.text and "gemini/g1" in res.json()["detail"]
+-- 
+2.43.0
+

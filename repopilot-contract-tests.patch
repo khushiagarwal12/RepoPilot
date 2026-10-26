@@ -1,0 +1,80 @@
+diff --git a/tests/test_api_contract.py b/tests/test_api_contract.py
+index dc36d98..7ece927 100644
+--- a/tests/test_api_contract.py
++++ b/tests/test_api_contract.py
+@@ -7,6 +7,7 @@ from pathlib import Path
+ from fastapi.routing import APIRoute
+ 
+ from backend.main import app
++from backend.routers import repo as repo_module
+ 
+ REPO_ROUTER = Path(__file__).resolve().parent.parent / "backend" / "routers" / "repo.py"
+ 
+@@ -28,20 +29,57 @@ def test_openapi_generates_without_duplicate_operation_id_warning():
+     assert len(op_ids) == len(set(op_ids))
+ 
+ 
++def _registrations(routes):
++    """(method, path) for every direct APIRoute in ``routes``."""
++    return [(m, r.path) for r in routes if isinstance(r, APIRoute) for m in r.methods]
++
++
++def _duplicates(routes):
++    return [k for k, n in Counter(_registrations(routes)).items() if n > 1]
++
++
++# (method, path relative to the router prefix) that the repository router must register.
++EXPECTED_REPO_ROUTES = {
++    ("GET", "/"),
++    ("POST", "/"),
++    ("GET", "/{repo_id}"),
++    ("GET", "/{repo_id}/jobs"),
++    ("GET", "/{repo_id}/definitions"),
++    ("GET", "/{repo_id}/chunks"),
++    ("POST", "/{repo_id}/search"),
++    ("POST", "/{repo_id}/ask"),
++}
++
++
+ def test_each_method_and_path_is_registered_once():
+-    routes = [
+-        (method, r.path)
+-        for r in app.routes
+-        if isinstance(r, APIRoute)
+-        for method in r.methods
+-    ]
+-    dupes = [k for k, n in Counter(routes).items() if n > 1]
+-    assert dupes == []
++    # Newer FastAPI (0.162+) keeps included routers as lazy wrappers, so app.routes no
++    # longer lists their APIRoute objects. Check the app's direct routes AND the router
++    # object itself, whose route list is the same in every FastAPI version.
++    assert _duplicates(app.routes) == []
++    assert _duplicates(repo_module.router.routes) == []
++
++    # Explicit contract: every expected method/path exists on the router (so the duplicate
++    # check above can never pass vacuously, whatever FastAPI does with app.routes).
++    prefix = repo_module.router.prefix
++    registered = set(_registrations(repo_module.router.routes))
++    missing = {(m, prefix + path) for m, path in EXPECTED_REPO_ROUTES} - registered
++    assert missing == set()
+ 
+ 
+ def test_exactly_one_search_route():
+-    search_routes = [r for r in app.routes if isinstance(r, APIRoute) and r.path.endswith("/search")]
+-    assert len(search_routes) == 1 and search_routes[0].methods == {"POST"}
++    # 1) Registration level: exactly one POST /search on the router itself (version independent).
++    router_search = [r for r in repo_module.router.routes if isinstance(r, APIRoute) and r.path.endswith("/search")]
++    assert len(router_search) == 1 and router_search[0].methods == {"POST"}
++
++    # 2) Older FastAPI copies included routes into app.routes: there, still require at most one.
++    app_search = [r for r in app.routes if isinstance(r, APIRoute) and r.path.endswith("/search")]
++    assert len(app_search) <= 1 and all(r.methods == {"POST"} for r in app_search)
++
++    # 3) Application level: the app really exposes it, as a single POST operation, in OpenAPI.
++    paths = app.openapi()["paths"]
++    search_paths = [p for p in paths if p.endswith("/search")]
++    assert search_paths == ["/repositories/{repo_id}/search"]
++    assert set(paths[search_paths[0]]) == {"post"}
+ 
+ 
+ def test_router_module_has_no_duplicate_function_definitions_or_imports():
