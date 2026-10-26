@@ -46,7 +46,16 @@ python scratch/ingest_test.py --timeout 600  # real end-to-end ingest against a 
 ```
 
 ## Configuration
-`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_MODEL`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
+`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_MODEL`, `OPENROUTER_API_KEY`, `LLM_MAX_RETRIES`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
+
+## LLM providers, retries and fallback
+`/ask` uses Google Gemini by default (`GEMINI_API_KEY`). To add an automatic fallback through [OpenRouter](https://openrouter.ai), put these in your **local** `.env` (never commit keys):
+```
+OPENROUTER_API_KEY=<your key>
+LLM_FALLBACK_PROVIDER=openrouter
+LLM_FALLBACK_MODEL=google/gemini-2.5-flash
+```
+Behaviour: HTTP 429/503 and timeouts are retried with exponential backoff (`LLM_MAX_RETRIES`, default 2 retries: 1 s, 2 s, ...). Authentication errors and other client errors are **not** retried. If the primary still fails, or its key is missing/invalid, the fallback is tried (with the same retry rules). If both fail, `/ask` returns a sanitized 503 listing each provider's failure. The evidence gate and citation validation run exactly the same whichever provider answered; `model` in the response shows which one did. You can also swap roles (`LLM_PROVIDER=openrouter`, `LLM_FALLBACK_PROVIDER=gemini`).
 
 ## Limitations
 Python files only; single API process (interrupted jobs are marked failed at startup); no authentication; in-memory rate limiter; embedding model truncates long chunks; answers are stateless (no chat history); `ASK_MIN_SCORE` needs calibration with real queries.

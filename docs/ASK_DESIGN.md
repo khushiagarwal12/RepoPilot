@@ -28,7 +28,7 @@ Errors: 404 unknown repo, 409 not indexed, 422 bad input, 503 embedding/vector/L
 - LLM failure/timeout -> 503, never a partial or invented answer.
 
 ## Config
-`GEMINI_API_KEY`, `LLM_MODEL` (default gemini-2.5-flash), `LLM_TIMEOUT_SECONDS` (45), `ASK_MIN_SCORE` (0.20). Only a Gemini adapter exists; add another class with `complete(system, user)` for other providers.
+`LLM_PROVIDER`/`LLM_MODEL` (primary, default gemini / gemini-2.5-flash), optional `LLM_FALLBACK_PROVIDER`/`LLM_FALLBACK_MODEL`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `LLM_MAX_RETRIES`, `LLM_RETRY_BASE_SECONDS`, `LLM_RETRY_MAX_SECONDS`, `LLM_TOTAL_TIMEOUT_SECONDS`, `LLM_TIMEOUT_SECONDS` (45), `ASK_MIN_SCORE` (0.20). Adapters: Gemini and OpenRouter, wrapped by `ResilientLLM` (retry on 429/503/timeouts, then fallback). Add another provider with a class exposing `complete(system, user)`, `provider` and `model`.
 
 ## Tests to write
 Fake-LLM answered path with valid citations; invalid/missing citations -> insufficient; gate blocks LLM call (assert not called); injection fixture in a chunk is ignored; LLM timeout/error -> 503; repo scoping; schema/OpenAPI.

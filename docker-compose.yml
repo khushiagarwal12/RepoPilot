@@ -31,6 +31,10 @@ services:
       CORS_ORIGINS: "http://localhost:8080"
       GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
       LLM_MODEL: "${LLM_MODEL:-gemini-2.5-flash}"
+      LLM_PROVIDER: "${LLM_PROVIDER:-gemini}"
+      LLM_FALLBACK_PROVIDER: "${LLM_FALLBACK_PROVIDER:-}"
+      LLM_FALLBACK_MODEL: "${LLM_FALLBACK_MODEL:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       ASK_MIN_SCORE: "${ASK_MIN_SCORE:-0.20}"
       RETRIEVAL_MODE: "${RETRIEVAL_MODE:-vector}"
     ports:

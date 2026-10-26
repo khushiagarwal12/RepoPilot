@@ -60,6 +60,17 @@ def get_repo_data_dir() -> Path:
     return PROJECT_ROOT / "repo_data"
 
 
+def int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+def float_env(name: str, default: float) -> float:
+    return _float_env(name, default)
+
+
 def _float_env(name: str, default: float) -> float:
     try:
         return float(os.getenv(name, default))
