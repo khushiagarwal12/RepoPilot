@@ -1,63 +1,213 @@
 # RepoPilot
 
-Index a public GitHub repository, then ask questions that are answered **only from its code**, with file/line citations. If the code doesn't contain the answer, RepoPilot says so instead of guessing.
+**Live Demo:** [http://35.234.220.163/](http://35.234.220.163/)  
+**GitHub Repository:** [khushiagarwal12/RepoPilot](https://github.com/khushiagarwal12/RepoPilot)
 
-**Stack:** FastAPI, SQLAlchemy + Alembic + PostgreSQL, ChromaDB, Python `ast`, sentence-transformers (local embeddings), Google Gemini (answers), React + TypeScript (Vite), Pytest/Vitest.
+RepoPilot is a code-grounded repository Q&A application that lets users index a public GitHub repository and ask natural-language questions about its Python code. It retrieves relevant code, generates answers using Google Gemini, and provides file-and-line citations so users can verify the evidence. An evidence gate prevents unsupported questions from triggering an LLM response when the retrieved code does not meet the configured relevance threshold.
 
-## What is verified
-| Feature | How it was checked |
+## Key Features
+
+- **Repository Ingestion:** Validates public GitHub URLs and safely processes repository archives with download limits and ZIP extraction safeguards.
+- **Code Parsing and Chunking:** Uses Python's AST to extract code symbols and create searchable chunks with repository-relative paths and line numbers.
+- **Semantic Retrieval:** Uses local sentence-transformer embeddings and ChromaDB for vector search, with optional hybrid keyword retrieval and overlap de-duplication.
+- **Grounded LLM Answers:** Integrates Google Gemini to answer questions using retrieved code evidence.
+- **Citation Validation:** Validates citations against retrieved evidence and returns code snippets for verification.
+- **Evidence-Based Rejection:** Rejects questions that lack sufficient supporting evidence instead of encouraging unsupported answers.
+- **Reliable Re-indexing:** Maintains job-specific vector indexes and handles failed re-indexing without prematurely replacing the active index.
+- **Backend Reliability and Security:** Includes request validation, structured JSON logging, secret redaction, rate limiting, safe error responses, and CORS configuration.
+
+## Tech Stack
+
+| Component | Technologies |
 |---|---|
-| Safe ingestion: URL allow-list, streamed download with size/time caps, ZIP extraction that skips symlinks and rejects traversal/bombs/devices | Unit tests; the real psf/requests archive extracted (2 symlinks skipped) |
-| Python parsing + chunking with repo-relative paths and line numbers | Unit tests; real ingest: 218 symbols, 380 chunks |
-| PostgreSQL models + Alembic (up/down/up, no drift, one active job per repo) | Tests against real PostgreSQL 16 (`TEST_POSTGRES_URL`) |
-| ChromaDB index per job, failure-safe re-indexing | Integration tests with real Chroma |
-| Semantic search (optional hybrid keyword fusion, overlap de-duplication) | Tests; hybrid vs vector still needs `scratch/eval_retrieval.py` on the real model |
-| `/ask` with evidence gate, citation validation, prompt-injection handling | Tests with a fake LLM and mocked Gemini HTTP |
-| Structured JSON logs with secret redaction, rate limiting, safe 500s, CORS | Tests |
-| React UI (submit, status, ask, citations, error/empty states) | 21 Vitest tests, typecheck and production build |
+| Backend | Python, FastAPI |
+| Database and Migrations | PostgreSQL, SQLAlchemy, Alembic |
+| Vector Database | ChromaDB |
+| Code Analysis | Python AST |
+| Embeddings | Sentence-Transformers |
+| LLM Integration | Google Gemini, optional OpenRouter fallback |
+| Frontend | React, TypeScript, Vite |
+| Testing | Pytest, Vitest |
+| Deployment | Docker Compose, Google Cloud VM |
 
-**Not verified:** a live Gemini call, hybrid retrieval quality, the Docker images and the GitHub Actions workflow (written but never executed in my environment), a real-browser end-to-end run.
+## Architecture Overview
 
-## Setup (Windows PowerShell)
+1. **Ingest:** Validate a repository URL, download its archive within configured limits, and extract permitted files safely.
+2. **Parse:** Extract Python code structure and split source into searchable chunks while preserving file paths and line numbers.
+3. **Index:** Generate embeddings locally and store vectors in ChromaDB, associated with the repository's indexing job.
+4. **Retrieve:** Search for code relevant to the user's question using the configured retrieval strategy.
+5. **Generate:** Apply an evidence gate before calling the configured LLM and validate generated citations against the retrieved evidence.
+6. **Respond:** Return the answer with supporting code references, or indicate that the available evidence is insufficient.
+
+## Verification and Testing
+
+| Area | Verification performed |
+|---|---|
+| Safe ingestion | Unit tests; extracted the real `psf/requests` archive, skipping two symlinks |
+| Parsing and chunking | Unit tests; real ingestion produced 218 symbols and 380 chunks |
+| PostgreSQL and migrations | Tests against PostgreSQL 16, including migration up/down/up, schema drift, and active-job constraints |
+| ChromaDB indexing | Integration tests with real ChromaDB, including failure-safe re-indexing |
+| Retrieval | Tests for semantic retrieval, optional hybrid keyword fusion, and overlap de-duplication |
+| LLM answer handling | Tests using a fake LLM and mocked Gemini HTTP responses for evidence gating, citation validation, and prompt-injection handling |
+| Backend safeguards | Tests for structured logs, secret redaction, rate limiting, CORS, and safe error responses |
+| Frontend | 21 Vitest tests, TypeScript typecheck, and production build |
+| Live deployment | Deployed on a Google Cloud VM; Gemini generation verified successfully against the configured model |
+
+**Still requiring additional verification:** Comparative hybrid-versus-vector retrieval quality on a real evaluation set, automated end-to-end browser testing, and execution of the Docker and GitHub Actions workflows in a clean environment.
+
+## Live Demo
+
+1. Open the [RepoPilot web application](http://35.234.220.163/).
+2. Submit a public Python repository, such as [`psf/requests`](https://github.com/psf/requests), for indexing.
+3. Wait for indexing to complete.
+4. Ask a question such as *"How are redirects handled?"* and inspect the answer's file-and-line citations.
+5. Try an unrelated question, such as *"What is the capital of France?"*, to observe the evidence gate's insufficient-evidence behavior.
+
+The first indexing run may take longer because the embedding model needs to be downloaded or initialized.
+
+## Local Setup — Windows PowerShell
+
+### Prerequisites
+
+- Python and pip
+- Node.js and npm
+- Docker Desktop with Docker Compose
+- A Google Gemini API key
+
+### 1. Clone and configure
+
 ```powershell
-git clone https://github.com/khushiagarwal12/RepoPilot.git; cd RepoPilot
-python -m venv .venv; .\.venv\Scripts\Activate.ps1
+git clone https://github.com/khushiagarwal12/RepoPilot.git
+cd RepoPilot
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
 pip install -r requirements.txt
-Copy-Item .env.example .env          # edit POSTGRES_URL and GEMINI_API_KEY; never commit .env
-docker compose up -d postgres        # database only
-alembic upgrade head
-uvicorn backend.main:app --reload    # http://127.0.0.1:8000/docs
+Copy-Item .env.example .env
 ```
-Frontend (second terminal): `cd frontend; npm install; npm run dev` then open http://localhost:5173.
 
-Everything in containers (unverified here): `docker compose --profile app up --build` -> UI on :8080, API on :8000. Data lives in named volumes (`pg_data`, `chroma_data`, `repo_data`, `hf_cache`).
+Configure the required database connection and Gemini API key in `.env`. **Never commit `.env` or API keys to Git.**
 
-## Demo workflow
-1. Paste `https://github.com/psf/requests` and press **Index**. The status badge moves pending -> running -> succeeded (the first run downloads the embedding model; the backend reports no percentage, so none is shown).
-2. Ask "How are redirects handled?". The answer cites `file:lines` with snippets.
-3. Ask something unrelated ("capital of France?"). You get "not enough evidence" with no LLM call.
+### 2. Start the database and backend
 
-## Tests
 ```powershell
-python -m pytest -q                          # backend (SQLite + real Chroma + stub embedder)
-$env:TEST_POSTGRES_URL="postgresql://postgres:<pw>@localhost:5432/repopilot_test"; python -m pytest tests/test_migrations_postgres.py
-cd frontend; npm test; npm run build
-python scratch/ingest_test.py --timeout 600  # real end-to-end ingest against a running API
+docker compose up -d postgres
+alembic upgrade head
+uvicorn backend.main:app --reload
+```
+
+The API and interactive API documentation are available at:
+
+- API: `http://127.0.0.1:8000`
+- Swagger UI: `http://127.0.0.1:8000/docs`
+
+### 3. Start the frontend
+
+In a second terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`.
+
+### Docker Deployment
+
+The application can also be started using the Compose app profile:
+
+```bash
+docker compose --profile app up --build -d
+```
+
+The Compose configuration exposes the web application and API on their configured ports. Check `docker-compose.yml` for the exact port mappings.
+
+## Running Tests
+
+### Backend
+
+```powershell
+python -m pytest -q
+```
+
+### PostgreSQL Migration Tests
+
+Set `TEST_POSTGRES_URL` to a dedicated test database before running:
+
+```powershell
+$env:TEST_POSTGRES_URL="postgresql://postgres:<pw>@localhost:5432/repopilot_test"
+python -m pytest tests/test_migrations_postgres.py
+```
+
+### Frontend
+
+```powershell
+cd frontend
+npm test
+npm run build
+```
+
+### Real Ingestion Test
+
+With a configured, running API:
+
+```powershell
+python scratch/ingest_test.py --timeout 600
 ```
 
 ## Configuration
-`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_PROVIDER`, `LLM_MODEL`, `LLM_FALLBACK_PROVIDER`, `LLM_FALLBACK_MODEL`, `OPENROUTER_API_KEY`, `LLM_MAX_RETRIES`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
 
-## LLM providers, retries and fallback
-`/ask` uses Google Gemini by default (`GEMINI_API_KEY`). To add an automatic fallback through [OpenRouter](https://openrouter.ai), put these in your **local** `.env` (never commit keys):
-```
-OPENROUTER_API_KEY=<your key>
+See `.env.example` for the full configuration reference. Important settings include:
+
+| Variable | Purpose |
+|---|---|
+| `POSTGRES_URL` | PostgreSQL connection string |
+| `GEMINI_API_KEY` | Gemini API authentication |
+| `LLM_PROVIDER` | Primary LLM provider |
+| `LLM_MODEL` | Primary model identifier |
+| `LLM_FALLBACK_PROVIDER` | Optional fallback provider |
+| `LLM_FALLBACK_MODEL` | Optional fallback model identifier |
+| `OPENROUTER_API_KEY` | Optional OpenRouter authentication |
+| `LLM_MAX_RETRIES` | Retry limit for eligible transient failures |
+| `LLM_TIMEOUT_SECONDS` | LLM request timeout |
+| `ASK_MIN_SCORE` | Evidence threshold; default `0.20`, not yet calibrated |
+| `RETRIEVAL_MODE` | `vector` or `hybrid` |
+| `RATE_LIMIT_PER_MINUTE` | API rate limit; `0` disables it |
+| `CORS_ORIGINS` | Allowed frontend origins |
+| `CHROMA_DB_PATH` | ChromaDB storage path |
+| `LOG_LEVEL` | Application logging level |
+
+## LLM Retries and Fallback
+
+RepoPilot uses Google Gemini by default. OpenRouter can optionally serve as a fallback.
+
+Add the following to your **local `.env`**, using your own key:
+
+```dotenv
+OPENROUTER_API_KEY=<your-key>
 LLM_FALLBACK_PROVIDER=openrouter
 LLM_FALLBACK_MODEL=google/gemini-2.5-flash
 ```
-Behaviour: HTTP 429/503 and timeouts are retried with exponential backoff (`LLM_MAX_RETRIES`, default 2 retries: 1 s, 2 s, ...). Authentication errors and other client errors are **not** retried. If the primary still fails, or its key is missing/invalid, the fallback is tried (with the same retry rules). If both fail, `/ask` returns a sanitized 503 listing each provider's failure. The evidence gate and citation validation run exactly the same whichever provider answered; `model` in the response shows which one did. You can also swap roles (`LLM_PROVIDER=openrouter`, `LLM_FALLBACK_PROVIDER=gemini`).
+
+Eligible transient failures, including HTTP 429/503 responses and timeouts, are retried with exponential backoff according to `LLM_MAX_RETRIES`. Authentication errors and other non-transient client errors are not retried. If the primary provider continues to fail or is unavailable, the configured fallback is attempted. If both providers fail, the API returns a sanitized error response.
+
+Evidence gating and citation validation are applied regardless of which provider answers. The response's `model` field identifies the model used.
 
 ## Limitations
-Python files only; single API process (interrupted jobs are marked failed at startup); no authentication; in-memory rate limiter; embedding model truncates long chunks; answers are stateless (no chat history); `ASK_MIN_SCORE` needs calibration with real queries.
 
-More: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ASK_DESIGN.md`, `docs/INTERVIEW_NOTES.md`.
+- Python files only.
+- No user authentication.
+- Single API process; interrupted jobs are marked failed at startup.
+- In-memory rate limiting.
+- Long chunks may be truncated by the embedding model.
+- Answers are stateless and do not maintain conversational history.
+- The evidence threshold requires calibration against representative real-world queries.
+
+## Further Documentation
+
+- `docs/ARCHITECTURE.md`
+- `docs/DECISIONS.md`
+- `docs/ASK_DESIGN.md`
+- `docs/INTERVIEW_NOTES.md`
