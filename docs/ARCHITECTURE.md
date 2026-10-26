@@ -26,5 +26,11 @@ POST /repositories/{id}/ask    -> same retrieval -> evidence gate -> Gemini -> c
 - Cleanup of old collections after commit may fail without affecting correctness (search ignores them).
 - A database partial unique index allows only one pending/running job per repository; jobs left active by a restart are marked failed at startup.
 
+## Frontend and operations
+- `frontend/` React + TypeScript (Vite) calls the API; polls real job status every 2 s while a job is active; renders answers and snippets as plain text.
+- Middleware: request id + JSON access log, CORS allow-list, per-IP rate limit on ingest/search/ask, generic 500 body (details only in redacted logs).
+- Retrieval: vector search over-fetches 3x, optional keyword fusion (`RETRIEVAL_MODE=hybrid`), then overlap de-duplication.
+- Deployment: `Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml` (profile `app`), `.github/workflows/ci.yml`.
+
 ## Known limits
 Python files only; single process; no auth/rate limiting; no LLM answering yet (`docs/ASK_DESIGN.md`).

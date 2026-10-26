@@ -1,0 +1,425 @@
+From b367fc4e772f3102baff03dd1c25cefd24df6e18 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 02:53:20 +0000
+Subject: [PATCH 3/3] Deployment and docs: Dockerfiles, compose app profile,
+ CI, Postgres migration tests, README and interview notes
+
+---
+ .dockerignore                     | 17 ++++++
+ .github/workflows/ci.yml          | 44 ++++++++++++++++
+ Dockerfile                        | 15 ++++++
+ README.md                         | 86 +++++++++++++------------------
+ docker-compose.yml                | 46 ++++++++++++++++-
+ docs/ARCHITECTURE.md              |  6 +++
+ docs/INTERVIEW_NOTES.md           | 15 ++++++
+ frontend/.dockerignore            |  3 ++
+ frontend/Dockerfile               | 12 +++++
+ tests/test_migrations_postgres.py | 59 +++++++++++++++++++++
+ 10 files changed, 252 insertions(+), 51 deletions(-)
+ create mode 100644 .dockerignore
+ create mode 100644 .github/workflows/ci.yml
+ create mode 100644 Dockerfile
+ create mode 100644 docs/INTERVIEW_NOTES.md
+ create mode 100644 frontend/.dockerignore
+ create mode 100644 frontend/Dockerfile
+ create mode 100644 tests/test_migrations_postgres.py
+
+diff --git a/.dockerignore b/.dockerignore
+new file mode 100644
+index 0000000..3bec49a
+--- /dev/null
++++ b/.dockerignore
+@@ -0,0 +1,17 @@
++.git
++.env
++.venv
++venv
++__pycache__/
++*.pyc
++.pytest_cache/
++chroma/
++chroma_store/
++repo_data/
++*.db
++*.sqlite3
++frontend/node_modules
++frontend/dist
++tests
++scratch
++docs
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+new file mode 100644
+index 0000000..25bda45
+--- /dev/null
++++ b/.github/workflows/ci.yml
+@@ -0,0 +1,44 @@
++name: CI
++on:
++  push: { branches: [main] }
++  pull_request:
++permissions:
++  contents: read
++
++jobs:
++  backend:
++    runs-on: ubuntu-latest
++    services:
++      postgres:
++        image: postgres:15-alpine
++        env: { POSTGRES_PASSWORD: postgres, POSTGRES_DB: repopilot_test }
++        ports: ["5432:5432"]
++        options: >-
++          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
++    env:
++      TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/repopilot_test
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with: { python-version: "3.12", cache: pip }
++      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install -r requirements.txt
++      - run: python -m pytest -q   # includes PostgreSQL migration tests via TEST_POSTGRES_URL
++
++  frontend:
++    runs-on: ubuntu-latest
++    defaults: { run: { working-directory: frontend } }
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with: { node-version: 22, cache: npm, cache-dependency-path: frontend/package-lock.json }
++      - run: npm ci
++      - run: npm test
++      - run: npm run build
++
++  docker-build:
++    runs-on: ubuntu-latest
++    needs: [backend, frontend]
++    steps:
++      - uses: actions/checkout@v4
++      - run: docker build -t repopilot-api .
++      - run: docker build -t repopilot-web frontend
+diff --git a/Dockerfile b/Dockerfile
+new file mode 100644
+index 0000000..a6c9a41
+--- /dev/null
++++ b/Dockerfile
+@@ -0,0 +1,15 @@
++FROM python:3.12-slim
++ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
++WORKDIR /app
++COPY requirements.txt .
++# CPU-only PyTorch first (the default Linux wheel pulls ~2 GB of CUDA libraries we do not need)
++RUN pip install torch --index-url https://download.pytorch.org/whl/cpu \
++ && pip install -r requirements.txt
++COPY alembic.ini .
++COPY alembic alembic
++COPY backend backend
++RUN useradd --create-home app && mkdir -p /data /app/repo_data && chown -R app /data /app
++USER app
++EXPOSE 8000
++# Apply migrations, then serve. Secrets come from environment variables, never from the image.
++CMD ["sh", "-c", "alembic upgrade head && uvicorn backend.main:app --host 0.0.0.0 --port 8000"]
+diff --git a/README.md b/README.md
+index 2614029..95b66d5 100644
+--- a/README.md
++++ b/README.md
+@@ -1,68 +1,54 @@
+ # RepoPilot
+ 
+-**AI‑powered Codebase Intelligence Assistant**
++Index a public GitHub repository, then ask questions that are answered **only from its code**, with file/line citations. If the code doesn't contain the answer, RepoPilot says so instead of guessing.
+ 
+-## Overview
+-RepoPilot lets a developer paste a public GitHub URL, indexes the repository, and answers natural‑language questions about the code.  It stores metadata in PostgreSQL and embeddings in Chroma.
++**Stack:** FastAPI, SQLAlchemy + Alembic + PostgreSQL, ChromaDB, Python `ast`, sentence-transformers (local embeddings), Google Gemini (answers), React + TypeScript (Vite), Pytest/Vitest.
+ 
+-## Prerequisites (Windows)
+-- Python 3.11+ (`python --version`)
+-- Docker Desktop (for PostgreSQL) **or** a local PostgreSQL installation
+-- Git (`git --version`)
+-- Node 20+ and npm (for the frontend – not required to run the backend)
+-- VS Code (recommended editor)
+-- No API key is needed today: embeddings run locally (`all-MiniLM-L6-v2`, downloaded on first use). `/ask` needs `GEMINI_API_KEY` (see `docs/ASK_DESIGN.md`).
+-
+-## Quick start (backend only)
++## What is verified
++| Feature | How it was checked |
++|---|---|
++| Safe ingestion: URL allow-list, streamed download with size/time caps, ZIP extraction that skips symlinks and rejects traversal/bombs/devices | Unit tests; the real psf/requests archive extracted (2 symlinks skipped) |
++| Python parsing + chunking with repo-relative paths and line numbers | Unit tests; real ingest: 218 symbols, 380 chunks |
++| PostgreSQL models + Alembic (up/down/up, no drift, one active job per repo) | Tests against real PostgreSQL 16 (`TEST_POSTGRES_URL`) |
++| ChromaDB index per job, failure-safe re-indexing | Integration tests with real Chroma |
++| Semantic search (optional hybrid keyword fusion, overlap de-duplication) | Tests; hybrid vs vector still needs `scratch/eval_retrieval.py` on the real model |
++| `/ask` with evidence gate, citation validation, prompt-injection handling | Tests with a fake LLM and mocked Gemini HTTP |
++| Structured JSON logs with secret redaction, rate limiting, safe 500s, CORS | Tests |
++| React UI (submit, status, ask, citations, error/empty states) | 21 Vitest tests, typecheck and production build |
++
++**Not verified:** a live Gemini call, hybrid retrieval quality, the Docker images and the GitHub Actions workflow (written but never executed in my environment), a real-browser end-to-end run.
++
++## Setup (Windows PowerShell)
+ ```powershell
+-# 1️⃣ Clone / create the project folder (you already have it)
+-cd C:\Users\Khushi Agarwal\Desktop\RepoPilot
+-
+-# 2️⃣ Create a virtual environment
+-python -m venv .venv
+-& .\.venv\Scripts\Activate.ps1
+-
+-# 3️⃣ Install Python deps
++git clone https://github.com/khushiagarwal12/RepoPilot.git; cd RepoPilot
++python -m venv .venv; .\.venv\Scripts\Activate.ps1
+ pip install -r requirements.txt
+-
+-# 3b Create your env file (never commit .env)
+-Copy-Item .env.example .env   # then edit POSTGRES_URL
+-
+-# 4️⃣ Spin up PostgreSQL (Docker) – keep it running in a separate terminal
+-docker compose -f docker-compose.yml up -d
+-
+-# 5️⃣ Apply DB migrations (once the DB is up)
++Copy-Item .env.example .env          # edit POSTGRES_URL and GEMINI_API_KEY; never commit .env
++docker compose up -d postgres        # database only
+ alembic upgrade head
+-
+-# 6️⃣ Run the FastAPI server
+-uvicorn backend.main:app --reload
++uvicorn backend.main:app --reload    # http://127.0.0.1:8000/docs
+ ```
+-Open <http://127.0.0.1:8000/health> in a browser – you should see `{ "status": "ok" }`.
++Frontend (second terminal): `cd frontend; npm install; npm run dev` then open http://localhost:5173.
+ 
+-## What works today (verified by tests)
+-Submit a public GitHub URL -> safe download/extract -> Python AST parsing + chunking -> PostgreSQL -> local embeddings -> ChromaDB -> per-repository semantic **search**. See `docs/ARCHITECTURE.md`.
+-
+-| Endpoint | Purpose |
+-|---|---|
+-| `POST /repositories/` | Start ingestion, returns `repository_id` and `job_id` |
+-| `GET /repositories/{id}/jobs` | Job status (`pending/running/succeeded/failed`) and log |
+-| `GET /repositories/{id}/definitions`, `/chunks` | Parsed symbols and persisted chunks |
+-| `POST /repositories/{id}/ask` | Grounded answer from retrieved chunks with citations (`{question, top_k}`); needs `GEMINI_API_KEY`. Returns `answered` or `insufficient_evidence` |
+-| `POST /repositories/{id}/search` | Semantic search (`{query, top_k}`), 409 if not indexed, 503 if index unavailable |
++Everything in containers (unverified here): `docker compose --profile app up --build` -> UI on :8080, API on :8000. Data lives in named volumes (`pg_data`, `chroma_data`, `repo_data`, `hf_cache`).
+ 
+-**Not implemented yet:** frontend, CI, Docker image for the API. Only Python files are indexed.
++## Demo workflow
++1. Paste `https://github.com/psf/requests` and press **Index**. The status badge moves pending -> running -> succeeded (the first run downloads the embedding model; the backend reports no percentage, so none is shown).
++2. Ask "How are redirects handled?". The answer cites `file:lines` with snippets.
++3. Ask something unrelated ("capital of France?"). You get "not enough evidence" with no LLM call.
+ 
+ ## Tests
+ ```powershell
+-python -m pytest -q
++python -m pytest -q                          # backend (SQLite + real Chroma + stub embedder)
++$env:TEST_POSTGRES_URL="postgresql://postgres:<pw>@localhost:5432/repopilot_test"; python -m pytest tests/test_migrations_postgres.py
++cd frontend; npm test; npm run build
++python scratch/ingest_test.py --timeout 600  # real end-to-end ingest against a running API
+ ```
+-Tests use SQLite, real ChromaDB in a temp folder and a small stand-in embedder (no model download). PostgreSQL migrations were verified separately (`alembic upgrade head` / `downgrade base`). First real ingest downloads the embedding model, so allow a few minutes: `python scratch/ingest_test.py --timeout 600`.
+ 
+-## Configuration (`.env`)
+-`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `CHROMA_DB_PATH` (default `chroma_store`), `REPOPILOT_ENV_FILE`. Local data folders `chroma_store/`, `repo_data/` are git-ignored.
++## Configuration
++`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_MODEL`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
+ 
+ ## Limitations
+-Single API process (interrupted jobs are marked failed at startup); no authentication or rate limiting; no CORS yet; the embedding model truncates long chunks (~256 tokens).
++Python files only; single API process (interrupted jobs are marked failed at startup); no authentication; in-memory rate limiter; embedding model truncates long chunks; answers are stateless (no chat history); `ASK_MIN_SCORE` needs calibration with real queries.
+ 
+----
+-*All secrets belong in a `.env` file that you create from `.env.example`.*
++More: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ASK_DESIGN.md`, `docs/INTERVIEW_NOTES.md`.
+diff --git a/docker-compose.yml b/docker-compose.yml
+index edf4e43..6574c62 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -5,7 +5,7 @@ services:
+     container_name: repopilot_pg
+     environment:
+       POSTGRES_USER: postgres
+-      POSTGRES_PASSWORD: postgres
++      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
+       POSTGRES_DB: repopilot
+     ports:
+       - "5432:5432"
+@@ -16,6 +16,50 @@ services:
+       interval: 5s
+       timeout: 5s
+       retries: 5
++
++  # --- application (start with: docker compose --profile app up --build) ---
++  api:
++    profiles: ["app"]
++    build: .
++    depends_on:
++      postgres:
++        condition: service_healthy
++    environment:
++      POSTGRES_URL: "postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/repopilot"
++      CHROMA_DB_PATH: /data/chroma_store
++      HF_HOME: /data/hf_cache
++      CORS_ORIGINS: "http://localhost:8080"
++      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
++      LLM_MODEL: "${LLM_MODEL:-gemini-2.5-flash}"
++      ASK_MIN_SCORE: "${ASK_MIN_SCORE:-0.20}"
++      RETRIEVAL_MODE: "${RETRIEVAL_MODE:-vector}"
++    ports:
++      - "8000:8000"
++    volumes:
++      - chroma_data:/data/chroma_store
++      - hf_cache:/data/hf_cache
++      - repo_data:/app/repo_data
++    healthcheck:
++      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
++      interval: 15s
++      timeout: 5s
++      retries: 5
++      start_period: 40s
++
++  web:
++    profiles: ["app"]
++    build:
++      context: ./frontend
++      args:
++        VITE_API_URL: "${VITE_API_URL:-http://localhost:8000}"
++    depends_on:
++      - api
++    ports:
++      - "8080:80"
++
+ volumes:
+   pg_data:
+     driver: local
++  chroma_data:
++  hf_cache:
++  repo_data:
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 2beee44..68b31ed 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -26,5 +26,11 @@ POST /repositories/{id}/ask    -> same retrieval -> evidence gate -> Gemini -> c
+ - Cleanup of old collections after commit may fail without affecting correctness (search ignores them).
+ - A database partial unique index allows only one pending/running job per repository; jobs left active by a restart are marked failed at startup.
+ 
++## Frontend and operations
++- `frontend/` React + TypeScript (Vite) calls the API; polls real job status every 2 s while a job is active; renders answers and snippets as plain text.
++- Middleware: request id + JSON access log, CORS allow-list, per-IP rate limit on ingest/search/ask, generic 500 body (details only in redacted logs).
++- Retrieval: vector search over-fetches 3x, optional keyword fusion (`RETRIEVAL_MODE=hybrid`), then overlap de-duplication.
++- Deployment: `Dockerfile`, `frontend/Dockerfile`, `docker-compose.yml` (profile `app`), `.github/workflows/ci.yml`.
++
+ ## Known limits
+ Python files only; single process; no auth/rate limiting; no LLM answering yet (`docs/ASK_DESIGN.md`).
+diff --git a/docs/INTERVIEW_NOTES.md b/docs/INTERVIEW_NOTES.md
+new file mode 100644
+index 0000000..0f887e5
+--- /dev/null
++++ b/docs/INTERVIEW_NOTES.md
+@@ -0,0 +1,15 @@
++# Interview notes (all claims map to code and tests in this repo)
++
++**What is it?** Repository Q&A: ingest -> parse/chunk -> embed -> retrieve -> grounded answer with verified citations.
++
++**PostgreSQL and ChromaDB can't share a transaction. How do you stay consistent?** Each ingestion job builds its own Chroma collection *before* the DB commit; the committed `succeeded` job is the pointer search reads. Failure rolls back the DB and drops the half-built collection, leaving the previous data and index intact. Orphans from crashes are never queried. Tests: `test_vector_pipeline.py`.
++
++**Security decisions?** Repository code is never executed (AST only). ZIPs: validate every member first, skip symlinks, stage the extraction, count real bytes, clean up on failure. Downloads: exact host allow-list, manual redirects restricted to GitHub hosts (SSRF), streamed size/time caps. Logs redact secrets. Tests: `test_security_archive.py`, `test_github_download.py`.
++
++**How do you stop hallucinated answers?** Evidence gate (no LLM call when the best score is low), citations only count if they point to real retrieved chunks and are rebuilt from DB rows, uncited answers are rejected. Repository text is untrusted: delimited with a random token, the model has no tools. Tests: `test_ask.py` (with mutation checks).
++
++**Why not LangGraph / pgvector?** The flows are linear, and one vector store keeps things simple (`docs/DECISIONS.md`).
++
++**A bug the tests had hidden:** the old symlink test asserted the buggy behaviour. I fixed the code, flipped the test, and mutation-tested that the new tests fail if the bug returns.
++
++**Honest limits:** hybrid retrieval and the score threshold need evaluation on the real model; Docker/CI are unexecuted; no auth.
+diff --git a/frontend/.dockerignore b/frontend/.dockerignore
+new file mode 100644
+index 0000000..9c97bbd
+--- /dev/null
++++ b/frontend/.dockerignore
+@@ -0,0 +1,3 @@
++node_modules
++dist
++.env
+diff --git a/frontend/Dockerfile b/frontend/Dockerfile
+new file mode 100644
+index 0000000..d240091
+--- /dev/null
++++ b/frontend/Dockerfile
+@@ -0,0 +1,12 @@
++FROM node:22-alpine AS build
++WORKDIR /app
++COPY package.json package-lock.json ./
++RUN npm ci
++COPY . .
++ARG VITE_API_URL=http://localhost:8000
++ENV VITE_API_URL=$VITE_API_URL
++RUN npm run build
++
++FROM nginx:1.27-alpine
++COPY --from=build /app/dist /usr/share/nginx/html
++EXPOSE 80
+diff --git a/tests/test_migrations_postgres.py b/tests/test_migrations_postgres.py
+new file mode 100644
+index 0000000..629b252
+--- /dev/null
++++ b/tests/test_migrations_postgres.py
+@@ -0,0 +1,59 @@
++"""Alembic against a REAL PostgreSQL. Runs only when TEST_POSTGRES_URL is set (CI sets it).
++
++SAFETY: this test drops and recreates the `public` schema, so it refuses to run unless the
++database name contains "test".
++"""
++import os
++from pathlib import Path
++
++import pytest
++from alembic import command
++from alembic.autogenerate import compare_metadata
++from alembic.config import Config
++from alembic.migration import MigrationContext
++from sqlalchemy import create_engine, text
++
++URL = os.getenv("TEST_POSTGRES_URL")
++pytestmark = pytest.mark.skipif(not URL, reason="TEST_POSTGRES_URL not set")
++ROOT = Path(__file__).resolve().parent.parent
++
++
++@pytest.fixture
++def pg(monkeypatch):
++    engine = create_engine(URL)
++    assert "test" in (engine.url.database or ""), "refusing to touch a non-test database"
++    with engine.begin() as c:
++        c.execute(text("DROP SCHEMA public CASCADE; CREATE SCHEMA public"))
++    monkeypatch.setenv("POSTGRES_URL", URL)
++    monkeypatch.setenv("REPOPILOT_ENV_FILE", str(ROOT / "does-not-exist.env"))
++    cfg = Config(str(ROOT / "alembic.ini"))
++    cfg.set_main_option("script_location", str(ROOT / "alembic"))
++    yield engine, cfg
++    engine.dispose()
++
++
++def test_upgrade_downgrade_upgrade_cycle_and_no_drift(pg):
++    engine, cfg = pg
++    command.upgrade(cfg, "head")
++    command.downgrade(cfg, "base")   # regression: used to leave the job_status enum behind
++    command.upgrade(cfg, "head")
++
++    os.environ.setdefault("REPOPILOT_ALLOW_SQLITE", "1")
++    from backend.database import Base
++    import backend.models  # noqa: F401
++    with engine.connect() as c:
++        assert compare_metadata(MigrationContext.configure(c), Base.metadata) == []
++
++
++def test_database_allows_only_one_active_job_per_repository(pg):
++    from sqlalchemy.exc import IntegrityError
++    engine, cfg = pg
++    command.upgrade(cfg, "head")
++    with engine.begin() as c:
++        c.execute(text("INSERT INTO repositories (github_url, name, active) VALUES ('u', 'n', true)"))
++        rid = c.execute(text("SELECT id FROM repositories")).scalar()
++        c.execute(text("INSERT INTO ingestion_jobs (repository_id, status) VALUES (:r, 'running')"), {"r": rid})
++        c.execute(text("INSERT INTO ingestion_jobs (repository_id, status) VALUES (:r, 'succeeded')"), {"r": rid})
++    with pytest.raises(IntegrityError):
++        with engine.begin() as c:
++            c.execute(text("INSERT INTO ingestion_jobs (repository_id, status) VALUES (:r, 'pending')"), {"r": rid})
+-- 
+2.43.0
+

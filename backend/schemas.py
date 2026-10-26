@@ -1,6 +1,7 @@
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
-from typing import Optional, List
 from datetime import datetime
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
 
 class RepositoryCreate(BaseModel):
@@ -62,6 +63,7 @@ class CodeChunkResponse(BaseModel):
 # --- Semantic search ---------------------------------------------------------
 
 class SearchRequest(BaseModel):
+    mode: Optional[Literal["vector", "hybrid"]] = Field(None, description="Override RETRIEVAL_MODE (for evaluation)")
     query: str = Field(..., min_length=1, max_length=2000, description="Natural-language or code query")
     top_k: int = Field(5, ge=1, le=50, description="Number of results to return (1-50)")
 
@@ -111,3 +113,16 @@ class AskResponse(BaseModel):
     citations: List[Citation] = []
     index_job_id: int
     model: Optional[str] = None
+
+
+class JobBrief(BaseModel):
+    id: int
+    status: str
+
+
+class RepositorySummary(BaseModel):
+    id: int
+    name: str
+    github_url: str
+    latest_job: Optional[JobBrief] = None
+    indexed: bool  # True only if a job has succeeded

@@ -1,68 +1,54 @@
 # RepoPilot
 
-**AI‑powered Codebase Intelligence Assistant**
+Index a public GitHub repository, then ask questions that are answered **only from its code**, with file/line citations. If the code doesn't contain the answer, RepoPilot says so instead of guessing.
 
-## Overview
-RepoPilot lets a developer paste a public GitHub URL, indexes the repository, and answers natural‑language questions about the code.  It stores metadata in PostgreSQL and embeddings in Chroma.
+**Stack:** FastAPI, SQLAlchemy + Alembic + PostgreSQL, ChromaDB, Python `ast`, sentence-transformers (local embeddings), Google Gemini (answers), React + TypeScript (Vite), Pytest/Vitest.
 
-## Prerequisites (Windows)
-- Python 3.11+ (`python --version`)
-- Docker Desktop (for PostgreSQL) **or** a local PostgreSQL installation
-- Git (`git --version`)
-- Node 20+ and npm (for the frontend – not required to run the backend)
-- VS Code (recommended editor)
-- No API key is needed today: embeddings run locally (`all-MiniLM-L6-v2`, downloaded on first use). `/ask` needs `GEMINI_API_KEY` (see `docs/ASK_DESIGN.md`).
-
-## Quick start (backend only)
-```powershell
-# 1️⃣ Clone / create the project folder (you already have it)
-cd C:\Users\Khushi Agarwal\Desktop\RepoPilot
-
-# 2️⃣ Create a virtual environment
-python -m venv .venv
-& .\.venv\Scripts\Activate.ps1
-
-# 3️⃣ Install Python deps
-pip install -r requirements.txt
-
-# 3b Create your env file (never commit .env)
-Copy-Item .env.example .env   # then edit POSTGRES_URL
-
-# 4️⃣ Spin up PostgreSQL (Docker) – keep it running in a separate terminal
-docker compose -f docker-compose.yml up -d
-
-# 5️⃣ Apply DB migrations (once the DB is up)
-alembic upgrade head
-
-# 6️⃣ Run the FastAPI server
-uvicorn backend.main:app --reload
-```
-Open <http://127.0.0.1:8000/health> in a browser – you should see `{ "status": "ok" }`.
-
-## What works today (verified by tests)
-Submit a public GitHub URL -> safe download/extract -> Python AST parsing + chunking -> PostgreSQL -> local embeddings -> ChromaDB -> per-repository semantic **search**. See `docs/ARCHITECTURE.md`.
-
-| Endpoint | Purpose |
+## What is verified
+| Feature | How it was checked |
 |---|---|
-| `POST /repositories/` | Start ingestion, returns `repository_id` and `job_id` |
-| `GET /repositories/{id}/jobs` | Job status (`pending/running/succeeded/failed`) and log |
-| `GET /repositories/{id}/definitions`, `/chunks` | Parsed symbols and persisted chunks |
-| `POST /repositories/{id}/ask` | Grounded answer from retrieved chunks with citations (`{question, top_k}`); needs `GEMINI_API_KEY`. Returns `answered` or `insufficient_evidence` |
-| `POST /repositories/{id}/search` | Semantic search (`{query, top_k}`), 409 if not indexed, 503 if index unavailable |
+| Safe ingestion: URL allow-list, streamed download with size/time caps, ZIP extraction that skips symlinks and rejects traversal/bombs/devices | Unit tests; the real psf/requests archive extracted (2 symlinks skipped) |
+| Python parsing + chunking with repo-relative paths and line numbers | Unit tests; real ingest: 218 symbols, 380 chunks |
+| PostgreSQL models + Alembic (up/down/up, no drift, one active job per repo) | Tests against real PostgreSQL 16 (`TEST_POSTGRES_URL`) |
+| ChromaDB index per job, failure-safe re-indexing | Integration tests with real Chroma |
+| Semantic search (optional hybrid keyword fusion, overlap de-duplication) | Tests; hybrid vs vector still needs `scratch/eval_retrieval.py` on the real model |
+| `/ask` with evidence gate, citation validation, prompt-injection handling | Tests with a fake LLM and mocked Gemini HTTP |
+| Structured JSON logs with secret redaction, rate limiting, safe 500s, CORS | Tests |
+| React UI (submit, status, ask, citations, error/empty states) | 21 Vitest tests, typecheck and production build |
 
-**Not implemented yet:** frontend, CI, Docker image for the API. Only Python files are indexed.
+**Not verified:** a live Gemini call, hybrid retrieval quality, the Docker images and the GitHub Actions workflow (written but never executed in my environment), a real-browser end-to-end run.
+
+## Setup (Windows PowerShell)
+```powershell
+git clone https://github.com/khushiagarwal12/RepoPilot.git; cd RepoPilot
+python -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Copy-Item .env.example .env          # edit POSTGRES_URL and GEMINI_API_KEY; never commit .env
+docker compose up -d postgres        # database only
+alembic upgrade head
+uvicorn backend.main:app --reload    # http://127.0.0.1:8000/docs
+```
+Frontend (second terminal): `cd frontend; npm install; npm run dev` then open http://localhost:5173.
+
+Everything in containers (unverified here): `docker compose --profile app up --build` -> UI on :8080, API on :8000. Data lives in named volumes (`pg_data`, `chroma_data`, `repo_data`, `hf_cache`).
+
+## Demo workflow
+1. Paste `https://github.com/psf/requests` and press **Index**. The status badge moves pending -> running -> succeeded (the first run downloads the embedding model; the backend reports no percentage, so none is shown).
+2. Ask "How are redirects handled?". The answer cites `file:lines` with snippets.
+3. Ask something unrelated ("capital of France?"). You get "not enough evidence" with no LLM call.
 
 ## Tests
 ```powershell
-python -m pytest -q
+python -m pytest -q                          # backend (SQLite + real Chroma + stub embedder)
+$env:TEST_POSTGRES_URL="postgresql://postgres:<pw>@localhost:5432/repopilot_test"; python -m pytest tests/test_migrations_postgres.py
+cd frontend; npm test; npm run build
+python scratch/ingest_test.py --timeout 600  # real end-to-end ingest against a running API
 ```
-Tests use SQLite, real ChromaDB in a temp folder and a small stand-in embedder (no model download). PostgreSQL migrations were verified separately (`alembic upgrade head` / `downgrade base`). First real ingest downloads the embedding model, so allow a few minutes: `python scratch/ingest_test.py --timeout 600`.
 
-## Configuration (`.env`)
-`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `CHROMA_DB_PATH` (default `chroma_store`), `REPOPILOT_ENV_FILE`. Local data folders `chroma_store/`, `repo_data/` are git-ignored.
+## Configuration
+`POSTGRES_URL` (required unless `REPOPILOT_ALLOW_SQLITE=1`), `GEMINI_API_KEY`, `LLM_MODEL`, `ASK_MIN_SCORE` (0.20, **uncalibrated**), `RETRIEVAL_MODE` (`vector`|`hybrid`), `RATE_LIMIT_PER_MINUTE` (30, 0=off), `CORS_ORIGINS`, `CHROMA_DB_PATH`, `LOG_LEVEL`, `LLM_TIMEOUT_SECONDS`. See `.env.example`.
 
 ## Limitations
-Single API process (interrupted jobs are marked failed at startup); no authentication or rate limiting; no CORS yet; the embedding model truncates long chunks (~256 tokens).
+Python files only; single API process (interrupted jobs are marked failed at startup); no authentication; in-memory rate limiter; embedding model truncates long chunks; answers are stateless (no chat history); `ASK_MIN_SCORE` needs calibration with real queries.
 
----
-*All secrets belong in a `.env` file that you create from `.env.example`.*
+More: `docs/ARCHITECTURE.md`, `docs/DECISIONS.md`, `docs/ASK_DESIGN.md`, `docs/INTERVIEW_NOTES.md`.

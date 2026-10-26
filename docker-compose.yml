@@ -5,7 +5,7 @@ services:
     container_name: repopilot_pg
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-postgres}"
       POSTGRES_DB: repopilot
     ports:
       - "5432:5432"
@@ -16,6 +16,50 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  # --- application (start with: docker compose --profile app up --build) ---
+  api:
+    profiles: ["app"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_URL: "postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/repopilot"
+      CHROMA_DB_PATH: /data/chroma_store
+      HF_HOME: /data/hf_cache
+      CORS_ORIGINS: "http://localhost:8080"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      LLM_MODEL: "${LLM_MODEL:-gemini-2.5-flash}"
+      ASK_MIN_SCORE: "${ASK_MIN_SCORE:-0.20}"
+      RETRIEVAL_MODE: "${RETRIEVAL_MODE:-vector}"
+    ports:
+      - "8000:8000"
+    volumes:
+      - chroma_data:/data/chroma_store
+      - hf_cache:/data/hf_cache
+      - repo_data:/app/repo_data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  web:
+    profiles: ["app"]
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: "${VITE_API_URL:-http://localhost:8000}"
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
 volumes:
   pg_data:
     driver: local
+  chroma_data:
+  hf_cache:
+  repo_data:

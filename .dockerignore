@@ -1,0 +1,17 @@
+.git
+.env
+.venv
+venv
+__pycache__/
+*.pyc
+.pytest_cache/
+chroma/
+chroma_store/
+repo_data/
+*.db
+*.sqlite3
+frontend/node_modules
+frontend/dist
+tests
+scratch
+docs

@@ -54,7 +54,7 @@ def build_prompt(question: str, hits) -> tuple[str, list]:
 def answer_question(question: str, retrieval: Retrieval, llm: LLMClient, min_score: float) -> AskResult:
     hits = retrieval.hits
     # Evidence gate: do not spend an LLM call (or risk a guess) without relevant material.
-    if not hits or hits[0][1] < min_score:
+    if not hits or max(score for _, score in hits) < min_score:
         return AskResult("insufficient_evidence")
 
     prompt, used = build_prompt(question, hits)

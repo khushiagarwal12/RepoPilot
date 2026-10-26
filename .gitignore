@@ -25,3 +25,8 @@ chroma_store/
 # Local SQLite databases (development/tests)
 *.sqlite3
 repopilot.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env

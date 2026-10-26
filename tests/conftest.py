@@ -38,5 +38,6 @@ class StubEmbeddingModel:
 @pytest.fixture(autouse=True)
 def isolated_chroma_and_embeddings(tmp_path, monkeypatch):
     monkeypatch.setenv("CHROMA_DB_PATH", str(tmp_path / "chroma_test_store"))
+    monkeypatch.setenv("RATE_LIMIT_PER_MINUTE", "0")
     monkeypatch.setattr(embeddings, "_model", StubEmbeddingModel())
     yield

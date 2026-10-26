@@ -19,7 +19,10 @@ from backend.llm import LLMClient, LLMError, get_llm_client
 from backend.models import CodeChunk, CodeDefinition, IngestionJob, Repository
 from backend.parser.python_ast import parse_repository
 from backend.retrieval import IndexUnavailableError, NotIndexedError, retrieve
+from backend.ratelimit import rate_limit
 from backend.schemas import (
+    JobBrief,
+    RepositorySummary,
     AskRequest,
     AskResponse,
     Citation,
@@ -184,7 +187,21 @@ def recover_interrupted_jobs(db_factory=SessionLocal) -> int:
         db.close()
 
 
-@router.post("/", response_model=IngestResponse)
+@router.get("/", response_model=List[RepositorySummary])
+def list_repositories(db: Session = Depends(get_db)):
+    """Most recent repositories (max 100) with their latest job status."""
+    out = []
+    for repo in db.query(Repository).order_by(Repository.id.desc()).limit(100).all():
+        jobs = db.query(IngestionJob).filter(IngestionJob.repository_id == repo.id).order_by(IngestionJob.id.desc()).all()
+        out.append(RepositorySummary(
+            id=repo.id, name=repo.name, github_url=repo.github_url,
+            latest_job=JobBrief(id=jobs[0].id, status=jobs[0].status) if jobs else None,
+            indexed=any(j.status == "succeeded" for j in jobs),
+        ))
+    return out
+
+
+@router.post("/", response_model=IngestResponse, dependencies=[Depends(rate_limit("ingest"))])
 def create_repository(payload: RepositoryCreate, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     url_str = str(payload.github_url).rstrip("/")
     try:
@@ -311,31 +328,31 @@ def _search_result(row: CodeChunk, score: float) -> SearchResult:
     )
 
 
-def _retrieve_or_http_error(db: Session, repo_id: int, query: str, top_k: int):
+def _retrieve_or_http_error(db: Session, repo_id: int, query: str, top_k: int, mode=None):
     repo = db.query(Repository).filter(Repository.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     try:
-        return retrieve(db, repo_id, query, top_k)
+        return retrieve(db, repo_id, query, top_k, mode)
     except NotIndexedError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except IndexUnavailableError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
 
-@router.post("/{repo_id}/search", response_model=List[SearchResult])
+@router.post("/{repo_id}/search", response_model=List[SearchResult], dependencies=[Depends(rate_limit("query"))])
 def search_repository(repo_id: int, req: SearchRequest, response: Response, db: Session = Depends(get_db)):
     """Semantic search over the code chunks of ONE repository (latest succeeded index).
 
     Errors are explicit, never an empty list that hides a failure:
     404 unknown repository; 409 not indexed yet; 503 embedding model or vector index unavailable / out of sync.
     """
-    result = _retrieve_or_http_error(db, repo_id, req.query, req.top_k)
+    result = _retrieve_or_http_error(db, repo_id, req.query, req.top_k, req.mode)
     response.headers["X-Index-Job-Id"] = str(result.job_id)
     return [_search_result(row, score) for row, score in result.hits]
 
 
-@router.post("/{repo_id}/ask", response_model=AskResponse)
+@router.post("/{repo_id}/ask", response_model=AskResponse, dependencies=[Depends(rate_limit("query"))])
 def ask_repository(repo_id: int, req: AskRequest, db: Session = Depends(get_db),
                    llm: LLMClient = Depends(get_llm_client)):
     """Answer a question using only retrieved chunks, with verifiable citations.

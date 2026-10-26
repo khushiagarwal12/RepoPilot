@@ -9,6 +9,19 @@ _URL_CREDENTIALS = re.compile(r"(://)([^/\s:@]+):([^/\s@]+)@")
 MAX_ERROR_CHARS = 500
 
 
+_TOKEN_PATTERNS = re.compile(r"(AIza[0-9A-Za-z_\-]{30,}|sk-[A-Za-z0-9_\-]{16,}|gh[pousr]_[A-Za-z0-9]{20,})")
+
+
+def redact_text(text: str) -> str:
+    """Mask URL credentials, well-known API-key shapes and secret-looking environment values."""
+    text = _URL_CREDENTIALS.sub(r"\1***:***@", text)
+    text = _TOKEN_PATTERNS.sub("***", text)
+    for name, value in os.environ.items():
+        if value and len(value) >= 6 and _SECRET_NAME.search(name):
+            text = text.replace(value, "***")
+    return text
+
+
 def sanitize_error(exc: BaseException, max_chars: int = MAX_ERROR_CHARS) -> str:
     """Return ``ExceptionType: message`` with secrets removed and length capped.
 
@@ -17,10 +30,7 @@ def sanitize_error(exc: BaseException, max_chars: int = MAX_ERROR_CHARS) -> str:
       PASSWORD, SECRET...) are masked if they appear in the message.
     """
     text = f"{type(exc).__name__}: {exc}"
-    text = _URL_CREDENTIALS.sub(r"\1***:***@", text)
-    for name, value in os.environ.items():
-        if value and len(value) >= 6 and _SECRET_NAME.search(name):
-            text = text.replace(value, "***")
+    text = redact_text(text)
     text = " ".join(text.split())  # collapse newlines/tabs
     if len(text) > max_chars:
         text = text[: max_chars - 3] + "..."
